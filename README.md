@@ -15,3 +15,5 @@ python seedvr2_convert.py --src seedvr2_ema_3b.pth \
     --job fp16:seedvr2_3b_fp16.safetensors \
     --job nvfp4:seedvr2_3b_nvfp4.safetensors
 ```
+
+The `mxfp8` and `nvfp4` modes require the `comfy-kitchen` package; the script exits with a message naming it if it is not installed.
