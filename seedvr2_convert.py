@@ -116,11 +116,11 @@ def sha256(path):
 def load_state_dict(pth):
     obj = torch.load(pth, map_location="cpu", weights_only=True, mmap=True)
     if isinstance(obj, dict):
-        if any(torch.is_tensor(v) for v in obj.values()):
-            return obj
         for key in ("state_dict", "ema", "model", "module", "params", "ema_model"):
             if key in obj and isinstance(obj[key], dict):
                 return obj[key]
+        if any(torch.is_tensor(v) for v in obj.values()):
+            return obj
     raise SystemExit(f"Unrecognized checkpoint structure: {type(obj)}")
 
 
