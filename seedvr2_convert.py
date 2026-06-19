@@ -274,7 +274,10 @@ def main():
 
     cond = None
     if args.cond:
-        pos_path, neg_path = args.cond.split(",")
+        parts = [p.strip() for p in args.cond.split(",")]
+        if len(parts) != 2 or not all(parts):
+            raise SystemExit("--cond must be 'pos_emb.pt,neg_emb.pt'")
+        pos_path, neg_path = parts
         cond = {
             "positive_conditioning": torch.load(pos_path, map_location="cpu", weights_only=True),
             "negative_conditioning": torch.load(neg_path, map_location="cpu", weights_only=True),
@@ -287,9 +290,13 @@ def main():
 
     mismatched = []
     for job in args.job:
-        parts = job.split(":")
-        precision, out = parts[0], parts[1]
-        expected = parts[2] if len(parts) > 2 and parts[2] else None
+        precision, sep, remainder = job.partition(":")
+        if not sep or not remainder:
+            raise SystemExit(f"invalid --job {job!r}; expected PRECISION:OUT[:SHA256]")
+        out, expected = remainder, None
+        head, sha_sep, tail = remainder.rpartition(":")
+        if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
+            out, expected = head, tail.lower()
         tensors = cast(sd, precision)
         if cond:
             tensors.update(cond)
