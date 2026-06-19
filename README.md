@@ -7,3 +7,11 @@ Utility scripts for packaging models for ComfyUI.
 ```sh
 python.exe merge_safetensors.py ".\source\folder\path" "target_file_path.safetensors"
 ```
+
+`seedvr2_convert.py`: Convert a ByteDance SeedVR2 `.pth` checkpoint into ComfyUI-loadable safetensors in `fp16`, `fp8_e4m3fn`, `mxfp8`, or `nvfp4`. Each `--job` writes one precision; an optional `PRECISION:OUT:SHA256` verifies the written file:
+
+```sh
+python seedvr2_convert.py --src seedvr2_ema_3b.pth \
+    --job fp16:seedvr2_3b_fp16.safetensors \
+    --job nvfp4:seedvr2_3b_nvfp4.safetensors
+```
