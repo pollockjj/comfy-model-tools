@@ -272,6 +272,17 @@ def main():
 
     sd = load_state_dict(args.src)
 
+    # A SeedVR2 DiT (it carries the emb_in/txt_in/vid_in input layers a VAE lacks) loads in ComfyUI
+    # only with the fixed text conditioning baked in. Refuse to write a DiT safetensors that omits
+    # positive_conditioning/negative_conditioning: ComfyUI rejects such a file, so a silent success
+    # here would hand back an unusable model. VAE checkpoints have no such layers and need no --cond.
+    if not args.cond and any(k.startswith(NVFP4_HIGH_RISK_PREFIXES) for k in sd):
+        raise SystemExit(
+            "source is a SeedVR2 DiT checkpoint; ComfyUI loads it only with conditioning baked in. "
+            "Re-run with --cond pos_emb.pt,neg_emb.pt (a DiT safetensors without "
+            "positive_conditioning/negative_conditioning is rejected at load)."
+        )
+
     cond = None
     if args.cond:
         parts = [p.strip() for p in args.cond.split(",")]
