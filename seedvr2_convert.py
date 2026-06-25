@@ -16,17 +16,17 @@ Precisions:
                                  artifacts on the 7B model)
   nvfp4                         eligible 2D .weight tensors -> TensorCoreNVFP4Layout; high-risk
                                 input/output projections, text/embedding input layers,
-                                tensorcore-ineligible shapes, and the model's last block
-                                stay float16; everything else -> float16
+                                tensorcore-ineligible shapes, and (7B only) the last block
+                                blocks.35 stay float16; everything else -> float16
   mxfp8                         eligible 2D .weight tensors -> TensorCoreMXFP8Layout; high-risk
                                 input/output projections, text/embedding input layers,
-                                and the model's last block stay float16; everything else -> float16
+                                and (7B only) the last block blocks.35 stay float16; everything else -> float16
   int8                          eligible 2D .weight tensors -> TensorWiseINT8Layout with ConvRot
                                 (per-channel weight scale + online group-wise Hadamard activation
                                 rotation, groupsize 256); high-risk input/output projections,
-                                text/embedding input layers, the model's last block, and weights
-                                whose in_features is not a multiple of 256 stay float16; everything
-                                else -> float16
+                                text/embedding input layers, (7B only) the last block blocks.35, and
+                                weights whose in_features is not a multiple of 256 stay float16;
+                                everything else -> float16
 
 Examples:
   # 3B DiT -> fp16 and fp8, conditioning baked in (one load serves both jobs)
@@ -47,7 +47,7 @@ Examples:
       --job nvfp4:seedvr2_3b_nvfp4.safetensors \
       --job mxfp8:seedvr2_3b_mxfp8.safetensors
 
-  # 7B DiT -> NVFP4 and MXFP8 (final block auto-detected and kept fp16)
+  # 7B DiT -> NVFP4 and MXFP8 (7B keeps blocks.35 fp16; the 3B above quantizes all blocks)
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job nvfp4:seedvr2_7b_nvfp4_mixed_block35_fp16.safetensors \
       --job mxfp8:seedvr2_7b_mxfp8_mixed_block35_fp16.safetensors
@@ -56,7 +56,7 @@ Examples:
   python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt \
       --job int8:seedvr2_3b_int8.safetensors
 
-  # 7B DiT -> INT8 ConvRot (final block auto-detected and kept fp16)
+  # 7B DiT -> INT8 ConvRot (7B keeps blocks.35 fp16; the 3B above quantizes all blocks)
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job int8:seedvr2_7b_int8_mixed_block35_fp16.safetensors
 
@@ -152,17 +152,15 @@ def roundup(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
 
 
-def detect_last_block_prefix(sd):
-    block_ids = []
-    for k in sd:
-        if not k.startswith("blocks."):
-            continue
-        parts = k.split(".", 2)
-        if len(parts) >= 2 and parts[1].isdigit():
-            block_ids.append(int(parts[1]))
-    if not block_ids:
-        return None
-    return f"blocks.{max(block_ids)}."
+def mixed_block35_prefix(sd):
+    # 3B vs 7B differentiation, matching the fp8 "mixed_block35_fp16" convention and the output
+    # filenames (seedvr2_3b_* carry no "mixed_block" suffix; seedvr2_7b_* do): only the 7B keeps
+    # its last DiT block (blocks.35) in fp16 to avoid line/tile artifacts. The 3B (last block
+    # blocks.31) quantizes every eligible block, exactly like the 3B fp8 checkpoint. Carve the
+    # block only when blocks.35 is present (the 7B); return None for the 3B.
+    if any(k.startswith("blocks.35.") for k in sd):
+        return "blocks.35."
+    return None
 
 
 def nvfp4_tensorcore_eligible(v):
@@ -274,7 +272,7 @@ def cast(sd, precision):
     int8_kept_fp16 = 0
     int8_kept_policy = 0
     int8_kept_shape = 0
-    last_block_prefix = detect_last_block_prefix(sd)
+    last_block_prefix = mixed_block35_prefix(sd)
     for k, v in sd.items():
         if not torch.is_tensor(v):
             continue
