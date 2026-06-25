@@ -21,6 +21,12 @@ Precisions:
   mxfp8                         eligible 2D .weight tensors -> TensorCoreMXFP8Layout; high-risk
                                 input/output projections, text/embedding input layers,
                                 and the model's last block stay float16; everything else -> float16
+  int8                          eligible 2D .weight tensors -> TensorWiseINT8Layout with ConvRot
+                                (per-channel weight scale + online group-wise Hadamard activation
+                                rotation, groupsize 256); high-risk input/output projections,
+                                text/embedding input layers, the model's last block, and weights
+                                whose in_features is not a multiple of 256 stay float16; everything
+                                else -> float16
 
 Examples:
   # 3B DiT -> fp16 and fp8, conditioning baked in (one load serves both jobs)
@@ -45,6 +51,14 @@ Examples:
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job nvfp4:seedvr2_7b_nvfp4_mixed_block35_fp16.safetensors \
       --job mxfp8:seedvr2_7b_mxfp8_mixed_block35_fp16.safetensors
+
+  # 3B DiT -> INT8 ConvRot (ComfyUI-native quantized weights), conditioning baked in
+  python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt \
+      --job int8:seedvr2_3b_int8.safetensors
+
+  # 7B DiT -> INT8 ConvRot (final block auto-detected and kept fp16)
+  python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
+      --job int8:seedvr2_7b_int8_mixed_block35_fp16.safetensors
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
 
@@ -96,6 +110,8 @@ FP8 = torch.float8_e4m3fn
 NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
 NVFP4_ALIGNMENT = 32
 MXFP8_LAYOUT = "TensorCoreMXFP8Layout"
+INT8_LAYOUT = "TensorWiseINT8Layout"
+INT8_CONVROT_GROUPSIZE = 256  # power-of-4 Hadamard group size; in_features must be a multiple
 NVFP4_HIGH_RISK_PREFIXES = (
     "emb_in.",
     "txt_in.",
@@ -103,6 +119,7 @@ NVFP4_HIGH_RISK_PREFIXES = (
     "vid_out.",
 )
 MXFP8_HIGH_RISK_PREFIXES = NVFP4_HIGH_RISK_PREFIXES
+INT8_HIGH_RISK_PREFIXES = NVFP4_HIGH_RISK_PREFIXES
 
 
 def sha256(path):
@@ -124,8 +141,11 @@ def load_state_dict(pth):
     raise SystemExit(f"Unrecognized checkpoint structure: {type(obj)}")
 
 
-def comfy_quant_tensor(format_name):
-    return torch.tensor(list(json.dumps({"format": format_name}).encode("utf-8")), dtype=torch.uint8)
+def comfy_quant_tensor(format_name, extra=None):
+    conf = {"format": format_name}
+    if extra:
+        conf.update(extra)
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
 def roundup(x, multiple):
@@ -199,6 +219,48 @@ def quantize_mxfp8_weight(k, v):
     return tensors
 
 
+def int8_convrot_eligible(v):
+    # ConvRot rotates along in_features in power-of-4 Hadamard groups; in_features must be a
+    # multiple of the group size or comfy_kitchen._rotate_weight raises.
+    if v.dim() != 2:
+        return False
+    return v.shape[1] % INT8_CONVROT_GROUPSIZE == 0
+
+
+def should_quantize_int8(k, v, last_block_prefix):
+    if not k.endswith(".weight") or v.dim() != 2:
+        return False
+    if last_block_prefix and k.startswith(last_block_prefix):
+        return False
+    if k.startswith(INT8_HIGH_RISK_PREFIXES):
+        return False
+    return int8_convrot_eligible(v)
+
+
+def quantize_int8_weight(k, v):
+    try:
+        from comfy_kitchen.tensor import QuantizedTensor
+    except ImportError as e:
+        raise SystemExit("int8 precision requires comfy-kitchen") from e
+
+    base = k[:-len(".weight")]
+    # ConvRot weight rotation + rowwise INT8 quant route through comfy_kitchen CUDA kernels.
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    qt = QuantizedTensor.from_float(
+        v.contiguous().to(dev),
+        INT8_LAYOUT,
+        is_weight=True,
+        per_channel=True,
+        convrot=True,
+        convrot_groupsize=INT8_CONVROT_GROUPSIZE,
+    )
+    tensors = {key: t.detach().to("cpu").contiguous() for key, t in qt.state_dict(f"{base}.weight").items()}
+    tensors[f"{base}.comfy_quant"] = comfy_quant_tensor(
+        "int8", {"convrot": True, "convrot_groupsize": INT8_CONVROT_GROUPSIZE}
+    )
+    return tensors
+
+
 def cast(sd, precision):
     out = {}
     nvfp4_quantized = 0
@@ -208,6 +270,10 @@ def cast(sd, precision):
     mxfp8_quantized = 0
     mxfp8_kept_fp16 = 0
     mxfp8_kept_policy = 0
+    int8_quantized = 0
+    int8_kept_fp16 = 0
+    int8_kept_policy = 0
+    int8_kept_shape = 0
     last_block_prefix = detect_last_block_prefix(sd)
     for k, v in sd.items():
         if not torch.is_tensor(v):
@@ -244,6 +310,20 @@ def cast(sd, precision):
                         mxfp8_kept_policy += 1
                     elif k.startswith(MXFP8_HIGH_RISK_PREFIXES):
                         mxfp8_kept_policy += 1
+        elif precision == "int8":
+            if should_quantize_int8(k, v, last_block_prefix):
+                out.update(quantize_int8_weight(k, v))
+                int8_quantized += 1
+            else:
+                out[k] = v.to(torch.float16)
+                int8_kept_fp16 += 1
+                if k.endswith(".weight") and v.dim() == 2:
+                    if last_block_prefix and k.startswith(last_block_prefix):
+                        int8_kept_policy += 1
+                    elif k.startswith(INT8_HIGH_RISK_PREFIXES):
+                        int8_kept_policy += 1
+                    elif not int8_convrot_eligible(v):
+                        int8_kept_shape += 1
         else:
             raise SystemExit(f"unknown precision: {precision}")
     if precision == "nvfp4":
@@ -256,6 +336,12 @@ def cast(sd, precision):
         print(
             f"mxfp8 quantized_weights={mxfp8_quantized} kept_fp16={mxfp8_kept_fp16} "
             f"kept_policy={mxfp8_kept_policy} last_block={last_block_prefix or 'none'}"
+        )
+    if precision == "int8":
+        print(
+            f"int8 quantized_weights={int8_quantized} kept_fp16={int8_kept_fp16} "
+            f"kept_policy={int8_kept_policy} kept_shape={int8_kept_shape} "
+            f"convrot_groupsize={INT8_CONVROT_GROUPSIZE} last_block={last_block_prefix or 'none'}"
         )
     return out
 
