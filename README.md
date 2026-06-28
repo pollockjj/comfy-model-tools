@@ -17,3 +17,13 @@ python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt 
 ```
 
 The `mxfp8` and `nvfp4` modes require the `comfy-kitchen` package; the script exits with a message naming it if it is not installed.
+
+`convert_diffusion_gemma.py`: Convert a Google DiffusionGemma HuggingFace snapshot into ComfyUI text-encoder safetensors. `bf16` writes Comfy key names without quantization. `fp8` writes Comfy-native in-band `weight` / `weight_scale` / `comfy_quant` triplets:
+
+```sh
+python convert_diffusion_gemma.py --src diffusiongemma-26B-A4B-it \
+    --job bf16:diffusiongemma_comfy_bf16.safetensors \
+    --job fp8:diffusiongemma_comfy_fp8.safetensors
+```
+
+The default `--fp8-policy balanced` quantizes fused MoE expert banks, decoder q/o attention weights, decoder dense MLP weights, and the decoder token embedding. `--fp8-policy conservative` keeps the original baseline footprint: fused MoE expert banks plus decoder q/o attention weights only.
