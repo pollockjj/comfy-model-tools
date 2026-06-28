@@ -21,6 +21,14 @@ ATTN_WEIGHT_SUFFIXES = (".self_attn.q_proj.weight", ".self_attn.o_proj.weight")
 EMBED_TOKENS_KEY = "model.decoder.embed_tokens.weight"
 
 
+class ShapeOnlyTensor:
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+    def dim(self):
+        return len(self.shape)
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -191,7 +199,7 @@ def dump(src, fp8_policy):
         with safe_open(shard, framework="pt") as f:
             for key in f.keys():
                 shape = tuple(f.get_slice(key).get_shape())
-                fake = torch.empty(shape)
+                fake = ShapeOnlyTensor(shape)
                 kind = should_quantize_fp8(key, fake, fp8_policy)
                 bucket = kind or ("skip_lm_head" if key.startswith("lm_head.") else "passthrough")
                 stats[bucket] += 1
