@@ -173,12 +173,14 @@ def quantize_fp8_scaled(key, tensor, fp8_max):
     }
 
 
-def quantize_int8_convrot(key, tensor):
+def quantize_int8_convrot(key, tensor, device):
     try:
         from comfy_kitchen.tensor import QuantizedTensor
     except ImportError as e:
         raise SystemExit("int8_convrot precision requires comfy-kitchen") from e
 
+    if device != "cpu":
+        tensor = tensor.to(device)
     qt = QuantizedTensor.from_float(
         tensor.contiguous(),
         INT8_LAYOUT,
@@ -189,7 +191,7 @@ def quantize_int8_convrot(key, tensor):
     )
     tensors = qt.state_dict(key)
     tensors[key.replace(".weight", ".comfy_quant")] = quant_tensor(INT8_CONF)
-    return tensors
+    return {name: value.cpu() for name, value in tensors.items()}
 
 
 def tokenizer_candidates(src, tokenizer):
@@ -213,7 +215,7 @@ def add_tokenizer_if_needed(src, tokenizer, out, stats):
     raise SystemExit("missing tokenizer_json tensor and no tokenizer.json found; pass --tokenizer")
 
 
-def convert(src, precision, text_only, tokenizer, fp8_max):
+def convert(src, precision, text_only, tokenizer, fp8_max, int8_device):
     if precision == "fp8":
         precision = "fp8_scaled"
     if precision == "int8":
@@ -247,7 +249,7 @@ def convert(src, precision, text_only, tokenizer, fp8_max):
                     out.update(quantize_fp8_scaled(out_key, tensor, fp8_max))
                     stats["fp8_scaled"] += 1
                 elif precision == "int8_convrot" and should_quantize_int8_convrot(out_key, tensor):
-                    out.update(quantize_int8_convrot(out_key, tensor))
+                    out.update(quantize_int8_convrot(out_key, tensor, int8_device))
                     stats["int8_convrot"] += 1
                 else:
                     out[out_key] = tensor
@@ -303,9 +305,9 @@ def dump(src, text_only, precision):
             print(f"  {key} -> {out_key} {shape}")
 
 
-def write_job(src, job, text_only, tokenizer, fp8_max):
+def write_job(src, job, text_only, tokenizer, fp8_max, int8_device):
     precision, out_path, expected = parse_job(job)
-    sd, stats = convert(src, precision, text_only, tokenizer, fp8_max)
+    sd, stats = convert(src, precision, text_only, tokenizer, fp8_max, int8_device)
     save_file(sd, out_path)
     digest = sha256(out_path)
     size_gb = tensor_bytes(sd) / 1024**3
@@ -324,6 +326,8 @@ def main():
     ap.add_argument("--text-only", action="store_true", help="drop vision/audio tower and projector tensors")
     ap.add_argument("--fp8-max", type=float, default=KIJAI_FP8_MAX,
                     help="FP8 scale divisor; default 416 matches the published Gemma 4 E4B FP8 artifact")
+    ap.add_argument("--int8-device", default="cuda",
+                    help="device for int8_convrot weight quantization; default cuda")
     ap.add_argument("--dump-precision", default="fp8_scaled",
                     help="precision policy to report with --dump; default fp8_scaled")
     ap.add_argument("--dump", action="store_true", help="print tensor routing without writing outputs")
@@ -336,7 +340,7 @@ def main():
             return
         raise SystemExit("at least one --job is required unless --dump is set")
     for job in args.job:
-        write_job(args.src, job, args.text_only, args.tokenizer, args.fp8_max)
+        write_job(args.src, job, args.text_only, args.tokenizer, args.fp8_max, args.int8_device)
 
 
 if __name__ == "__main__":
