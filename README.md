@@ -34,3 +34,7 @@ The default `--fp8-policy balanced` quantizes fused MoE expert banks, decoder q/
 python convert_gemma4.py --src gemma4_e4b_it_bf16.safetensors \
     --job fp8_scaled:gemma4_e4b_it_fp8_scaled.safetensors:bf0b4fa2e41a25684dc9e9b256cd505564f02fed09be3da95ce024e653e2c52b
 ```
+
+`gemma4_convert_v2.py`: SeedVR2-style Gemma 4 converter shell. The first implemented job is the
+same byte-identical V1 `fp8_scaled` policy; optimized INT8 is the next target and is not in the
+shell commit.
