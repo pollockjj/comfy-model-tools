@@ -132,25 +132,10 @@ def should_quantize_fp8_scaled(key, tensor):
     )
 
 
-def tensor_row_chunks(tensor, rows):
-    for start in range(0, tensor.shape[0], rows):
-        end = min(start + rows, tensor.shape[0])
-        yield start, end, tensor[start:end]
-
-
-def fp8_scaled_scale(tensor, fp8_max, chunk_rows):
-    amax = None
-    for _, _, chunk in tensor_row_chunks(tensor, chunk_rows):
-        chunk_amax = torch.max(torch.abs(chunk.float()))
-        amax = chunk_amax if amax is None else torch.maximum(amax, chunk_amax)
-    return amax / fp8_max
-
-
-def quantize_fp8_scaled(key, tensor, fp8_max, chunk_rows):
-    scale = fp8_scaled_scale(tensor, fp8_max, chunk_rows)
-    q = torch.empty(tensor.shape, dtype=FP8_DTYPE)
-    for start, end, chunk in tensor_row_chunks(tensor, chunk_rows):
-        q[start:end] = (chunk.float() / scale).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(dtype=FP8_DTYPE)
+def quantize_fp8_scaled(key, tensor, fp8_max):
+    w = tensor.float()
+    scale = torch.max(torch.abs(w)) / fp8_max
+    q = (w / scale).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(dtype=FP8_DTYPE)
     return {
         key: q,
         key.replace(".weight", ".weight_scale"): scale.cpu(),
@@ -179,7 +164,7 @@ def add_tokenizer_if_needed(src, tokenizer, out, stats):
     raise SystemExit("missing tokenizer_json tensor and no tokenizer.json found; pass --tokenizer")
 
 
-def convert(src, precision, text_only, tokenizer, fp8_max, chunk_rows):
+def convert(src, precision, text_only, tokenizer, fp8_max):
     if precision == "fp8":
         precision = "fp8_scaled"
     if precision not in {"bf16", "fp16", "fp8_scaled"}:
@@ -208,7 +193,7 @@ def convert(src, precision, text_only, tokenizer, fp8_max, chunk_rows):
                     out[out_key] = cast_floating(tensor, torch.float16)
                     stats["fp16"] += 1
                 elif should_quantize_fp8_scaled(out_key, tensor):
-                    out.update(quantize_fp8_scaled(out_key, tensor, fp8_max, chunk_rows))
+                    out.update(quantize_fp8_scaled(out_key, tensor, fp8_max))
                     stats["fp8_scaled"] += 1
                 else:
                     out[out_key] = tensor
@@ -249,9 +234,9 @@ def dump(src, text_only):
             print(f"  {key} -> {out_key} {shape}")
 
 
-def write_job(src, job, text_only, tokenizer, fp8_max, chunk_rows):
+def write_job(src, job, text_only, tokenizer, fp8_max):
     precision, out_path, expected = parse_job(job)
-    sd, stats = convert(src, precision, text_only, tokenizer, fp8_max, chunk_rows)
+    sd, stats = convert(src, precision, text_only, tokenizer, fp8_max)
     save_file(sd, out_path)
     digest = sha256(out_path)
     size_gb = tensor_bytes(sd) / 1024**3
@@ -270,8 +255,6 @@ def main():
     ap.add_argument("--text-only", action="store_true", help="drop vision/audio tower and projector tensors")
     ap.add_argument("--fp8-max", type=float, default=KIJAI_FP8_MAX,
                     help="FP8 scale divisor; default 416 matches the published Gemma 4 E4B FP8 artifact")
-    ap.add_argument("--chunk-rows", type=int, default=4096,
-                    help="rows per FP8 conversion chunk; affects peak RAM but not the quantization policy")
     ap.add_argument("--dump", action="store_true", help="print tensor routing without writing outputs")
     args = ap.parse_args()
 
@@ -281,10 +264,8 @@ def main():
         if args.dump:
             return
         raise SystemExit("at least one --job is required unless --dump is set")
-    if args.chunk_rows < 1:
-        raise SystemExit("--chunk-rows must be positive")
     for job in args.job:
-        write_job(args.src, job, args.text_only, args.tokenizer, args.fp8_max, args.chunk_rows)
+        write_job(args.src, job, args.text_only, args.tokenizer, args.fp8_max)
 
 
 if __name__ == "__main__":
