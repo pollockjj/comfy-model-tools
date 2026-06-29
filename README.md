@@ -27,10 +27,3 @@ python convert_diffusion_gemma.py --src diffusiongemma-26B-A4B-it \
 ```
 
 The default `--fp8-policy balanced` quantizes fused MoE expert banks, decoder q/o attention weights, decoder dense MLP weights, and the decoder token embedding. `--fp8-policy conservative` keeps the original baseline footprint: fused MoE expert banks plus decoder q/o attention weights only.
-
-`convert_gemma4.py`: Convert Google Gemma 4 safetensors into ComfyUI format or reproduce the published Comfy-Org FP8-scaled E4B artifact from the Comfy BF16 file. `fp8_scaled` matches Kijai's rev-1 policy: large 2D `model.*.weight` tensors use `float8_e4m3fn` plus scalar `weight_scale` and `comfy_quant`; all other tensors pass through unchanged.
-
-```sh
-python convert_gemma4.py --src gemma4_e4b_it_bf16.safetensors \
-    --job fp8_scaled:gemma4_e4b_it_fp8_scaled.safetensors:bf0b4fa2e41a25684dc9e9b256cd505564f02fed09be3da95ce024e653e2c52b
-```
