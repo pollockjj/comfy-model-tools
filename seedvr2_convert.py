@@ -111,6 +111,7 @@ NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
 NVFP4_ALIGNMENT = 32
 MXFP8_LAYOUT = "TensorCoreMXFP8Layout"
 INT8_LAYOUT = "TensorWiseINT8Layout"
+INT8_FORMAT = "int8_tensorwise"
 INT8_CONVROT_GROUPSIZE = 256  # power-of-4 Hadamard group size; in_features must be a multiple
 NVFP4_HIGH_RISK_PREFIXES = (
     "emb_in.",
@@ -254,7 +255,7 @@ def quantize_int8_weight(k, v):
     )
     tensors = {key: t.detach().to("cpu").contiguous() for key, t in qt.state_dict(f"{base}.weight").items()}
     tensors[f"{base}.comfy_quant"] = comfy_quant_tensor(
-        "int8", {"convrot": True, "convrot_groupsize": INT8_CONVROT_GROUPSIZE}
+        INT8_FORMAT, {"convrot": True, "convrot_groupsize": INT8_CONVROT_GROUPSIZE}
     )
     return tensors
 
