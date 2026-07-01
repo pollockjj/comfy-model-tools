@@ -17,3 +17,23 @@ python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt 
 ```
 
 The `mxfp8` and `nvfp4` modes require the `comfy-kitchen` package; the script exits with a message naming it if it is not installed.
+
+
+## Int8-convrot quantization
+
+### 1. Dry-run first (good idea to do this on a new architecture) — prints the plan, writes nothing
+`python quant_int8_auto.py model_bf16.safetensors --dry-run`
+
+### 2. Quantize (defaults: absmax, min-gemm 256)
+`python quant_int8_auto.py model_bf16.safetensors model_int8_convrot.safetensors`
+
+### args
+```
+--dry-run — plan only (grouped quantize list + what's left behind, with reasons)
+--exclude RE / --include RE — regex overrides on layer base names
+--min-gemm N — skip layers with min(N,K) < N (default 256)
+--mseclip — MSE-optimal clip instead of absmax, usually lower weight error, experimental
+--downcast-fp32 — shrink stray fp32 passthrough to the compute dtype
+--warn-thresh F — warn on any quantized layer over F% relerr (default 2.0)
+--verify-report PATH — dump the full per-layer (relerr, cos, gs) table
+```
