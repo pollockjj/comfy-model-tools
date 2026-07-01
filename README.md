@@ -21,10 +21,12 @@ The `mxfp8` and `nvfp4` modes require the `comfy-kitchen` package; the script ex
 
 ## Int8-convrot quantization
 
-### 1. Dry-run first (good idea to do this on a new architecture) — prints the plan, writes nothing
+Dry-run first (good idea to do this on a new architecture) — prints the plan, writes nothing
+  
 `python quant_int8_auto.py model_bf16.safetensors --dry-run`
 
-### 2. Quantize (defaults: absmax, min-gemm 256)
+Quantize (defaults: absmax, min-gemm 256)
+  
 `python quant_int8_auto.py model_bf16.safetensors model_int8_convrot.safetensors`
 
 ### args
