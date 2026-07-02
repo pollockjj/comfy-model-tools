@@ -24,9 +24,10 @@ Precisions:
   int8                          eligible 2D .weight tensors -> TensorWiseINT8Layout with ConvRot
                                 (per-channel weight scale + online group-wise Hadamard activation
                                 rotation, groupsize 256); high-risk input/output projections,
-                                text/embedding input layers, (7B only) the last block blocks.35, and
-                                weights whose in_features is not a multiple of 256 stay float16;
-                                everything else -> float16
+                                text/embedding input layers, and weights whose in_features is not
+                                a multiple of 256 stay float16; everything else -> float16.
+                                All DiT blocks are quantized, including the last block (blocks.35
+                                on 7B); int8 has no mixed-precision block exemption
 
 Examples:
   # 3B DiT -> fp16 and fp8, conditioning baked in (one load serves both jobs)
@@ -56,9 +57,9 @@ Examples:
   python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt \
       --job int8:seedvr2_3b_int8.safetensors
 
-  # 7B DiT -> INT8 ConvRot (7B keeps blocks.35 fp16; the 3B above quantizes all blocks)
+  # 7B DiT -> INT8 ConvRot (all blocks quantized, including blocks.35)
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
-      --job int8:seedvr2_7b_int8_mixed_block35_fp16.safetensors
+      --job int8:seedvr2_7b_int8.safetensors
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
 
@@ -226,10 +227,8 @@ def int8_convrot_eligible(v):
     return v.shape[1] % INT8_CONVROT_GROUPSIZE == 0
 
 
-def should_quantize_int8(k, v, last_block_prefix):
+def should_quantize_int8(k, v):
     if not k.endswith(".weight") or v.dim() != 2:
-        return False
-    if last_block_prefix and k.startswith(last_block_prefix):
         return False
     if k.startswith(INT8_HIGH_RISK_PREFIXES):
         return False
@@ -310,16 +309,14 @@ def cast(sd, precision):
                     elif k.startswith(MXFP8_HIGH_RISK_PREFIXES):
                         mxfp8_kept_policy += 1
         elif precision == "int8":
-            if should_quantize_int8(k, v, last_block_prefix):
+            if should_quantize_int8(k, v):
                 out.update(quantize_int8_weight(k, v))
                 int8_quantized += 1
             else:
                 out[k] = v.to(torch.float16)
                 int8_kept_fp16 += 1
                 if k.endswith(".weight") and v.dim() == 2:
-                    if last_block_prefix and k.startswith(last_block_prefix):
-                        int8_kept_policy += 1
-                    elif k.startswith(INT8_HIGH_RISK_PREFIXES):
+                    if k.startswith(INT8_HIGH_RISK_PREFIXES):
                         int8_kept_policy += 1
                     elif not int8_convrot_eligible(v):
                         int8_kept_shape += 1
@@ -340,7 +337,7 @@ def cast(sd, precision):
         print(
             f"int8 quantized_weights={int8_quantized} kept_fp16={int8_kept_fp16} "
             f"kept_policy={int8_kept_policy} kept_shape={int8_kept_shape} "
-            f"convrot_groupsize={INT8_CONVROT_GROUPSIZE} last_block={last_block_prefix or 'none'}"
+            f"convrot_groupsize={INT8_CONVROT_GROUPSIZE} last_block=quantized(full-model)"
         )
     return out
 
