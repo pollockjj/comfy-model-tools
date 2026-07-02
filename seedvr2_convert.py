@@ -20,8 +20,10 @@ Precisions:
                                 float16. All DiT blocks are quantized, including the last block
                                 (blocks.35 on 7B); nvfp4 has no mixed-precision block exemption
   mxfp8                         eligible 2D .weight tensors -> TensorCoreMXFP8Layout; high-risk
-                                input/output projections, text/embedding input layers,
-                                and (7B only) the last block blocks.35 stay float16; everything else -> float16
+                                input/output projections and text/embedding input layers stay
+                                float16; everything else -> float16. All DiT blocks are quantized,
+                                including the last block (blocks.35 on 7B); mxfp8 has no
+                                mixed-precision block exemption
   int8                          eligible 2D .weight tensors -> TensorWiseINT8Layout with ConvRot
                                 (per-channel weight scale + online group-wise Hadamard activation
                                 rotation, groupsize 256); high-risk input/output projections,
@@ -52,7 +54,7 @@ Examples:
   # 7B DiT -> NVFP4 (all blocks quantized) and MXFP8 (7B keeps blocks.35 fp16)
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job nvfp4:seedvr2_7b_nvfp4.safetensors \
-      --job mxfp8:seedvr2_7b_mxfp8_mixed_block35_fp16.safetensors
+      --job mxfp8:seedvr2_7b_mxfp8.safetensors
 
   # 3B DiT -> INT8 ConvRot (ComfyUI-native quantized weights), conditioning baked in
   python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt \
@@ -180,10 +182,8 @@ def should_quantize_nvfp4(k, v):
     return nvfp4_tensorcore_eligible(v)
 
 
-def should_quantize_mxfp8(k, v, last_block_prefix):
+def should_quantize_mxfp8(k, v):
     if not k.endswith(".weight") or v.dim() != 2:
-        return False
-    if last_block_prefix and k.startswith(last_block_prefix):
         return False
     if k.startswith(MXFP8_HIGH_RISK_PREFIXES):
         return False
@@ -294,16 +294,14 @@ def cast(sd, precision):
                     elif k.startswith(NVFP4_HIGH_RISK_PREFIXES):
                         nvfp4_kept_policy += 1
         elif precision == "mxfp8":
-            if should_quantize_mxfp8(k, v, last_block_prefix):
+            if should_quantize_mxfp8(k, v):
                 out.update(quantize_mxfp8_weight(k, v))
                 mxfp8_quantized += 1
             else:
                 out[k] = v.to(torch.float16)
                 mxfp8_kept_fp16 += 1
                 if k.endswith(".weight") and v.dim() == 2:
-                    if last_block_prefix and k.startswith(last_block_prefix):
-                        mxfp8_kept_policy += 1
-                    elif k.startswith(MXFP8_HIGH_RISK_PREFIXES):
+                    if k.startswith(MXFP8_HIGH_RISK_PREFIXES):
                         mxfp8_kept_policy += 1
         elif precision == "int8":
             if should_quantize_int8(k, v):
@@ -328,7 +326,7 @@ def cast(sd, precision):
     if precision == "mxfp8":
         print(
             f"mxfp8 quantized_weights={mxfp8_quantized} kept_fp16={mxfp8_kept_fp16} "
-            f"kept_policy={mxfp8_kept_policy} last_block={last_block_prefix or 'none'}"
+            f"kept_policy={mxfp8_kept_policy} last_block=quantized(full-model)"
         )
     if precision == "int8":
         print(
