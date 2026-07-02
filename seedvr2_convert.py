@@ -91,16 +91,19 @@ Outputs  ( sha256  file  <-  source.pth, precision [+ conditioning] ):
   20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1  ema_vae_fp16.safetensors  <- ema_vae.pth, fp16 (no cond)
   98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660  seedvr2_3b_fp16.safetensors  <- seedvr2_ema_3b.pth, fp16 + cond
   a0226eaa2c3e6f47ae5ce83225120f16479da890ced1a3bc32b1a14619787914  seedvr2_3b_fp8_e4m3fn.safetensors  <- seedvr2_ema_3b.pth, fp8_e4m3fn + cond
-  2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252  seedvr2_7b_fp16.safetensors  <- seedvr2_ema_7b.pth, fp16 + cond
-  d89ac95ee1566dfc1ee50c6075a2bfe4028d811dd8751f584505de89ef5c4cf3  seedvr2_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b.pth, fp8_e4m3fn_mixed_block35_fp16 + cond
-  70823bca54b9c24eeb56e1c452697c7c2a430867e58db0e376c6e260f3a4489d  seedvr2_7b_sharp_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, fp16 + cond
-  700ee64fe0859c3df3abfa40c89f3a16068651bf8c8e5294726b6369e7b0d1e3  seedvr2_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, fp8_e4m3fn_mixed_block35_fp16 + cond
-  6acf15dca5bb83556d38b7c06a8e4402a87ef94d0010e974b464855c41eaba6a  seedvr2_3b_nvfp4.safetensors  <- seedvr2_ema_3b.pth, nvfp4 + cond
+  c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157  seedvr2_3b_int8.safetensors  <- seedvr2_ema_3b.pth, int8 + cond
   cf0d30d90a92424ce77f5836898be05ff5b8e8f731120a02d8642cff5ed4d87c  seedvr2_3b_mxfp8.safetensors  <- seedvr2_ema_3b.pth, mxfp8 + cond
-  0ee5d7c4c4aac94fd24e3b68bb6e977aa4c7526e83499e183434cf6cced05fae  seedvr2_7b_nvfp4_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b.pth, nvfp4 + cond
-  a9fc925e2a8fd1a1615030e79151c39e0bd6c6f5fab14b454125d94c2497a85f  seedvr2_7b_mxfp8_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b.pth, mxfp8 + cond
-  d5814e47c0b8cd968e0477e62a2e2663501c5fd1a2319f6dc8ba03efa35e0d56  seedvr2_7b_sharp_nvfp4_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, nvfp4 + cond
-  8f8b98662fd6d1919d55b0646a6546b0e57262270264eac4d56f4d352660a4c6  seedvr2_7b_sharp_mxfp8_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, mxfp8 + cond
+  6acf15dca5bb83556d38b7c06a8e4402a87ef94d0010e974b464855c41eaba6a  seedvr2_3b_nvfp4.safetensors  <- seedvr2_ema_3b.pth, nvfp4 + cond
+  2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252  seedvr2_7b_fp16.safetensors  <- seedvr2_ema_7b.pth, fp16 + cond
+  5065e77d647dd553d9090a81e20d6de590d931a61df79d785e008433926ee418  seedvr2_7b_fp8_e4m3fn.safetensors  <- seedvr2_ema_7b.pth, fp8_e4m3fn + cond
+  5aa0d25fc9d35e449b659d0c9a5dcb22e2a4fa04032101b95a39da42b32c1be6  seedvr2_7b_int8.safetensors  <- seedvr2_ema_7b.pth, int8 + cond
+  b40804f47910d96c5089c728cc7ec8b57b956750eabb6397dc4e6e697477263d  seedvr2_7b_mxfp8.safetensors  <- seedvr2_ema_7b.pth, mxfp8 + cond
+  cc4af1a7bd5377066496f393555478323e806fa21163bdbe3409451aface9b93  seedvr2_7b_nvfp4.safetensors  <- seedvr2_ema_7b.pth, nvfp4 + cond
+  70823bca54b9c24eeb56e1c452697c7c2a430867e58db0e376c6e260f3a4489d  seedvr2_7b_sharp_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, fp16 + cond
+  7602c5f70868d28e7730035e4e9d745b05d661c8f0a7eb758e63f9c8603596ef  seedvr2_7b_sharp_fp8_e4m3fn.safetensors  <- seedvr2_ema_7b_sharp.pth, fp8_e4m3fn + cond
+  db48be2f1cc7e36b01a2aa529810f5d9c6a971edd29be225cf1b0eb18d51c366  seedvr2_7b_sharp_int8.safetensors  <- seedvr2_ema_7b_sharp.pth, int8 + cond
+  0d621ec1561a11ca9b5f432ec6d4e09b263b61f4b83b0280552c8b4add030ec3  seedvr2_7b_sharp_mxfp8.safetensors  <- seedvr2_ema_7b_sharp.pth, mxfp8 + cond
+  80d57af7722f5a5bd4c01d2ab2688f2bf05e552e59d3d3287257de709db10397  seedvr2_7b_sharp_nvfp4.safetensors  <- seedvr2_ema_7b_sharp.pth, nvfp4 + cond
 """
 import argparse
 import collections
