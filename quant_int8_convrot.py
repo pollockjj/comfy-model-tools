@@ -150,6 +150,30 @@ def recon_metrics(qd, scale, w_ref, gs, device="cuda"):
     relerr = ((deq - wf).norm() / wf.norm().clamp(min=1e-30)).item() * 100.0
     return cos, relerr
 
+@torch.no_grad()
+def quantize_convrot_chunked(w, gs, mseclip=True, device="cuda", max_elems=1 << 27):
+    """Row-chunked quantize + metrics: identical results (rows are independent), fp32 peak bounded
+    by ~3 * max_elems * 4 bytes instead of 3x the full tensor. Metric sums aggregate exactly."""
+    rows = max(1, max_elems // max(1, w.shape[1]))
+    h = _build_hadamard(gs, device=device, dtype=torch.float32)
+    qds, scales = [], []
+    dot = deq2 = ref2 = err2 = 0.0
+    for i in range(0, w.shape[0], rows):
+        wc = w[i:i + rows]
+        qd, scale = quantize_convrot(wc, gs, mseclip=mseclip, device=device)
+        deq = qd.to(device).float() * scale.to(device)
+        deq = _rotate_weight(deq, h, gs)
+        wf = wc.to(device, torch.float32)
+        dot += (deq * wf).sum().item()
+        deq2 += (deq * deq).sum().item()
+        ref2 += (wf * wf).sum().item()
+        err2 += ((deq - wf) ** 2).sum().item()
+        qds.append(qd.cpu())
+        scales.append(scale.cpu())
+    cos = dot / max((deq2 * ref2) ** 0.5, 1e-30)
+    relerr = (err2 / max(ref2, 1e-30)) ** 0.5 * 100.0
+    return torch.cat(qds), torch.cat(scales), cos, relerr
+
 def cq_tensor(gs):
     cfg = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": gs}
     return torch.tensor(list(json.dumps(cfg).encode("utf-8")), dtype=torch.uint8)
@@ -170,6 +194,7 @@ def main():
     ap.add_argument("--downcast-fp32", action="store_true", help="downcast stray fp32 passthrough linears to compute dtype")
     ap.add_argument("--warn-thresh", type=float, default=2.0, help="warn on any quantized layer whose relerr%% exceeds this (default 2.0)")
     ap.add_argument("--verify-report", default=None, help="write the full per-layer (relerr, cos, gs) table to this path")
+    ap.add_argument("--device", default="cuda", help="device for the quantize/verify math (default cuda)")
     args = ap.parse_args()
     if not args.dst and not args.dry_run:
         # derive dst from src: swap dtype token for int8_convrot (else append), always .safetensors
@@ -258,8 +283,7 @@ def main():
                 w = t
             if base in quant_set:
                 gs = best_gs(w.shape[1])
-                qd, scale = quantize_convrot(w, gs, mseclip=args.mseclip)
-                cos, relerr = recon_metrics(qd, scale, w, gs)
+                qd, scale, cos, relerr = quantize_convrot_chunked(w, gs, mseclip=args.mseclip, device=args.device)
                 assert cos > 0.99, f"BROKEN quant (rotation/format?) {base} cos={cos:.5f} relerr={relerr:.2f}%"
                 if relerr > args.warn_thresh:
                     print(f"  WARN high error: {base} gs={gs} relerr={relerr:.2f}% cos={cos:.5f}", flush=True)
@@ -279,7 +303,8 @@ def main():
                     out[key] = w.to(target)
                 else:
                     out[key] = t
-            torch.cuda.empty_cache()
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
         save_file(out, args.dst, metadata=dict(src_meta))
         print(f"DONE: quantized {nq} layers, {len(out)} tensors, {time.time()-t0:.1f}s -> {args.dst}")
 
