@@ -11,26 +11,19 @@ copied through as-is (bf16).
 Precisions:
   fp16                          every tensor -> float16
   fp8_e4m3fn                    every tensor -> float8_e4m3fn
-  fp8_e4m3fn_mixed_block35_fp16 float8_e4m3fn, but tensors under "blocks.35." kept float16
-                                (keeping the last DiT block in fp16 avoids line/tile
-                                 artifacts on the 7B model)
   nvfp4                         eligible 2D .weight tensors -> TensorCoreNVFP4Layout; high-risk
                                 input/output projections, text/embedding input layers, and
                                 tensorcore-ineligible shapes stay float16; everything else ->
-                                float16. All DiT blocks are quantized, including the last block
-                                (blocks.35 on 7B); nvfp4 has no mixed-precision block exemption
+                                float16. All DiT blocks are quantized
   mxfp8                         eligible 2D .weight tensors -> TensorCoreMXFP8Layout; high-risk
                                 input/output projections and text/embedding input layers stay
-                                float16; everything else -> float16. All DiT blocks are quantized,
-                                including the last block (blocks.35 on 7B); mxfp8 has no
-                                mixed-precision block exemption
+                                float16; everything else -> float16. All DiT blocks are quantized
   int8                          eligible 2D .weight tensors -> TensorWiseINT8Layout with ConvRot
                                 (per-channel weight scale + online group-wise Hadamard activation
                                 rotation, groupsize 256); high-risk input/output projections,
                                 text/embedding input layers, and weights whose in_features is not
                                 a multiple of 256 stay float16; everything else -> float16.
-                                All DiT blocks are quantized, including the last block (blocks.35
-                                on 7B); int8 has no mixed-precision block exemption
+                                All DiT blocks are quantized
 
 Examples:
   # 3B DiT -> fp16 and fp8, conditioning baked in (one load serves both jobs)
@@ -38,10 +31,10 @@ Examples:
       --job fp16:seedvr2_3b_fp16.safetensors \
       --job fp8_e4m3fn:seedvr2_3b_fp8_e4m3fn.safetensors
 
-  # 7B DiT -> fp16 and block35-mixed fp8
+  # 7B DiT -> fp16 and fp8
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job fp16:seedvr2_7b_fp16.safetensors \
-      --job fp8_e4m3fn_mixed_block35_fp16:seedvr2_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors
+      --job fp8_e4m3fn:seedvr2_7b_fp8_e4m3fn.safetensors
 
   # VAE (no conditioning)
   python seedvr2_convert.py --src ema_vae.pth --job fp16:ema_vae_fp16.safetensors
@@ -51,7 +44,7 @@ Examples:
       --job nvfp4:seedvr2_3b_nvfp4.safetensors \
       --job mxfp8:seedvr2_3b_mxfp8.safetensors
 
-  # 7B DiT -> NVFP4 (all blocks quantized) and MXFP8 (7B keeps blocks.35 fp16)
+  # 7B DiT -> NVFP4 and MXFP8
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job nvfp4:seedvr2_7b_nvfp4.safetensors \
       --job mxfp8:seedvr2_7b_mxfp8.safetensors
@@ -60,7 +53,7 @@ Examples:
   python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt \
       --job int8:seedvr2_3b_int8.safetensors
 
-  # 7B DiT -> INT8 ConvRot (all blocks quantized, including blocks.35)
+  # 7B DiT -> INT8 ConvRot
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
       --job int8:seedvr2_7b_int8.safetensors
 
@@ -92,8 +85,8 @@ Outputs  ( sha256  file  <-  source.pth, precision [+ conditioning] ):
   98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660  seedvr2_3b_fp16.safetensors  <- seedvr2_ema_3b.pth, fp16 + cond
   a0226eaa2c3e6f47ae5ce83225120f16479da890ced1a3bc32b1a14619787914  seedvr2_3b_fp8_e4m3fn.safetensors  <- seedvr2_ema_3b.pth, fp8_e4m3fn + cond
   c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157  seedvr2_3b_int8.safetensors  <- seedvr2_ema_3b.pth, int8 + cond
-  cf0d30d90a92424ce77f5836898be05ff5b8e8f731120a02d8642cff5ed4d87c  seedvr2_3b_mxfp8.safetensors  <- seedvr2_ema_3b.pth, mxfp8 + cond
-  6acf15dca5bb83556d38b7c06a8e4402a87ef94d0010e974b464855c41eaba6a  seedvr2_3b_nvfp4.safetensors  <- seedvr2_ema_3b.pth, nvfp4 + cond
+  768623e3bfb1752b4d0668782751b5fead58b1bcb153f0b5e03a423095630297  seedvr2_3b_mxfp8.safetensors  <- seedvr2_ema_3b.pth, mxfp8 + cond
+  c8dea38b04d43295621726e2cd371c0d2d001006169c113aea17950f2cb2e295  seedvr2_3b_nvfp4.safetensors  <- seedvr2_ema_3b.pth, nvfp4 + cond
   2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252  seedvr2_7b_fp16.safetensors  <- seedvr2_ema_7b.pth, fp16 + cond
   5065e77d647dd553d9090a81e20d6de590d931a61df79d785e008433926ee418  seedvr2_7b_fp8_e4m3fn.safetensors  <- seedvr2_ema_7b.pth, fp8_e4m3fn + cond
   5aa0d25fc9d35e449b659d0c9a5dcb22e2a4fa04032101b95a39da42b32c1be6  seedvr2_7b_int8.safetensors  <- seedvr2_ema_7b.pth, int8 + cond
@@ -158,17 +151,6 @@ def comfy_quant_tensor(format_name, extra=None):
 
 def roundup(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
-
-
-def mixed_block35_prefix(sd):
-    # 3B vs 7B differentiation, matching the fp8 "mixed_block35_fp16" convention and the output
-    # filenames (seedvr2_3b_* carry no "mixed_block" suffix; seedvr2_7b_* do): only the 7B keeps
-    # its last DiT block (blocks.35) in fp16 to avoid line/tile artifacts. The 3B (last block
-    # blocks.31) quantizes every eligible block, exactly like the 3B fp8 checkpoint. Carve the
-    # block only when blocks.35 is present (the 7B); return None for the 3B.
-    if any(k.startswith("blocks.35.") for k in sd):
-        return "blocks.35."
-    return None
 
 
 def nvfp4_tensorcore_eligible(v):
@@ -274,7 +256,6 @@ def cast(sd, precision):
     int8_kept_fp16 = 0
     int8_kept_policy = 0
     int8_kept_shape = 0
-    last_block_prefix = mixed_block35_prefix(sd)
     for k, v in sd.items():
         if not torch.is_tensor(v):
             continue
@@ -282,8 +263,6 @@ def cast(sd, precision):
             out[k] = v.to(torch.float16)
         elif precision == "fp8_e4m3fn":
             out[k] = v.to(FP8)
-        elif precision == "fp8_e4m3fn_mixed_block35_fp16":
-            out[k] = v.to(torch.float16) if k.startswith("blocks.35.") else v.to(FP8)
         elif precision == "nvfp4":
             if should_quantize_nvfp4(k, v):
                 out.update(quantize_nvfp4_weight(k, v))
@@ -323,19 +302,18 @@ def cast(sd, precision):
     if precision == "nvfp4":
         print(
             f"nvfp4 quantized_weights={nvfp4_quantized} kept_fp16={nvfp4_kept_fp16} "
-            f"kept_policy={nvfp4_kept_policy} kept_shape={nvfp4_kept_shape} "
-            f"last_block=quantized(full-model)"
+            f"kept_policy={nvfp4_kept_policy} kept_shape={nvfp4_kept_shape}"
         )
     if precision == "mxfp8":
         print(
             f"mxfp8 quantized_weights={mxfp8_quantized} kept_fp16={mxfp8_kept_fp16} "
-            f"kept_policy={mxfp8_kept_policy} last_block=quantized(full-model)"
+            f"kept_policy={mxfp8_kept_policy}"
         )
     if precision == "int8":
         print(
             f"int8 quantized_weights={int8_quantized} kept_fp16={int8_kept_fp16} "
             f"kept_policy={int8_kept_policy} kept_shape={int8_kept_shape} "
-            f"convrot_groupsize={INT8_CONVROT_GROUPSIZE} last_block=quantized(full-model)"
+            f"convrot_groupsize={INT8_CONVROT_GROUPSIZE}"
         )
     return out
 
