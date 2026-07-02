@@ -15,12 +15,22 @@ Precisions:
                                 (keeping the last DiT block in fp16 avoids line/tile
                                  artifacts on the 7B model)
   nvfp4                         eligible 2D .weight tensors -> TensorCoreNVFP4Layout; high-risk
-                                input/output projections, text/embedding input layers,
-                                tensorcore-ineligible shapes, and the model's last block
-                                stay float16; everything else -> float16
+                                input/output projections, text/embedding input layers, and
+                                tensorcore-ineligible shapes stay float16; everything else ->
+                                float16. All DiT blocks are quantized, including the last block
+                                (blocks.35 on 7B); nvfp4 has no mixed-precision block exemption
   mxfp8                         eligible 2D .weight tensors -> TensorCoreMXFP8Layout; high-risk
-                                input/output projections, text/embedding input layers,
-                                and the model's last block stay float16; everything else -> float16
+                                input/output projections and text/embedding input layers stay
+                                float16; everything else -> float16. All DiT blocks are quantized,
+                                including the last block (blocks.35 on 7B); mxfp8 has no
+                                mixed-precision block exemption
+  int8                          eligible 2D .weight tensors -> TensorWiseINT8Layout with ConvRot
+                                (per-channel weight scale + online group-wise Hadamard activation
+                                rotation, groupsize 256); high-risk input/output projections,
+                                text/embedding input layers, and weights whose in_features is not
+                                a multiple of 256 stay float16; everything else -> float16.
+                                All DiT blocks are quantized, including the last block (blocks.35
+                                on 7B); int8 has no mixed-precision block exemption
 
 Examples:
   # 3B DiT -> fp16 and fp8, conditioning baked in (one load serves both jobs)
@@ -41,10 +51,18 @@ Examples:
       --job nvfp4:seedvr2_3b_nvfp4.safetensors \
       --job mxfp8:seedvr2_3b_mxfp8.safetensors
 
-  # 7B DiT -> NVFP4 and MXFP8 (final block auto-detected and kept fp16)
+  # 7B DiT -> NVFP4 (all blocks quantized) and MXFP8 (7B keeps blocks.35 fp16)
   python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
-      --job nvfp4:seedvr2_7b_nvfp4_mixed_block35_fp16.safetensors \
-      --job mxfp8:seedvr2_7b_mxfp8_mixed_block35_fp16.safetensors
+      --job nvfp4:seedvr2_7b_nvfp4.safetensors \
+      --job mxfp8:seedvr2_7b_mxfp8.safetensors
+
+  # 3B DiT -> INT8 ConvRot (ComfyUI-native quantized weights), conditioning baked in
+  python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt \
+      --job int8:seedvr2_3b_int8.safetensors
+
+  # 7B DiT -> INT8 ConvRot (all blocks quantized, including blocks.35)
+  python seedvr2_convert.py --src seedvr2_ema_7b.pth --cond pos_emb.pt,neg_emb.pt \
+      --job int8:seedvr2_7b_int8.safetensors
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
 
@@ -73,16 +91,19 @@ Outputs  ( sha256  file  <-  source.pth, precision [+ conditioning] ):
   20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1  ema_vae_fp16.safetensors  <- ema_vae.pth, fp16 (no cond)
   98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660  seedvr2_3b_fp16.safetensors  <- seedvr2_ema_3b.pth, fp16 + cond
   a0226eaa2c3e6f47ae5ce83225120f16479da890ced1a3bc32b1a14619787914  seedvr2_3b_fp8_e4m3fn.safetensors  <- seedvr2_ema_3b.pth, fp8_e4m3fn + cond
-  2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252  seedvr2_7b_fp16.safetensors  <- seedvr2_ema_7b.pth, fp16 + cond
-  d89ac95ee1566dfc1ee50c6075a2bfe4028d811dd8751f584505de89ef5c4cf3  seedvr2_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b.pth, fp8_e4m3fn_mixed_block35_fp16 + cond
-  70823bca54b9c24eeb56e1c452697c7c2a430867e58db0e376c6e260f3a4489d  seedvr2_7b_sharp_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, fp16 + cond
-  700ee64fe0859c3df3abfa40c89f3a16068651bf8c8e5294726b6369e7b0d1e3  seedvr2_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, fp8_e4m3fn_mixed_block35_fp16 + cond
-  6acf15dca5bb83556d38b7c06a8e4402a87ef94d0010e974b464855c41eaba6a  seedvr2_3b_nvfp4.safetensors  <- seedvr2_ema_3b.pth, nvfp4 + cond
+  c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157  seedvr2_3b_int8.safetensors  <- seedvr2_ema_3b.pth, int8 + cond
   cf0d30d90a92424ce77f5836898be05ff5b8e8f731120a02d8642cff5ed4d87c  seedvr2_3b_mxfp8.safetensors  <- seedvr2_ema_3b.pth, mxfp8 + cond
-  0ee5d7c4c4aac94fd24e3b68bb6e977aa4c7526e83499e183434cf6cced05fae  seedvr2_7b_nvfp4_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b.pth, nvfp4 + cond
-  a9fc925e2a8fd1a1615030e79151c39e0bd6c6f5fab14b454125d94c2497a85f  seedvr2_7b_mxfp8_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b.pth, mxfp8 + cond
-  d5814e47c0b8cd968e0477e62a2e2663501c5fd1a2319f6dc8ba03efa35e0d56  seedvr2_7b_sharp_nvfp4_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, nvfp4 + cond
-  8f8b98662fd6d1919d55b0646a6546b0e57262270264eac4d56f4d352660a4c6  seedvr2_7b_sharp_mxfp8_mixed_block35_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, mxfp8 + cond
+  6acf15dca5bb83556d38b7c06a8e4402a87ef94d0010e974b464855c41eaba6a  seedvr2_3b_nvfp4.safetensors  <- seedvr2_ema_3b.pth, nvfp4 + cond
+  2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252  seedvr2_7b_fp16.safetensors  <- seedvr2_ema_7b.pth, fp16 + cond
+  5065e77d647dd553d9090a81e20d6de590d931a61df79d785e008433926ee418  seedvr2_7b_fp8_e4m3fn.safetensors  <- seedvr2_ema_7b.pth, fp8_e4m3fn + cond
+  5aa0d25fc9d35e449b659d0c9a5dcb22e2a4fa04032101b95a39da42b32c1be6  seedvr2_7b_int8.safetensors  <- seedvr2_ema_7b.pth, int8 + cond
+  b40804f47910d96c5089c728cc7ec8b57b956750eabb6397dc4e6e697477263d  seedvr2_7b_mxfp8.safetensors  <- seedvr2_ema_7b.pth, mxfp8 + cond
+  cc4af1a7bd5377066496f393555478323e806fa21163bdbe3409451aface9b93  seedvr2_7b_nvfp4.safetensors  <- seedvr2_ema_7b.pth, nvfp4 + cond
+  70823bca54b9c24eeb56e1c452697c7c2a430867e58db0e376c6e260f3a4489d  seedvr2_7b_sharp_fp16.safetensors  <- seedvr2_ema_7b_sharp.pth, fp16 + cond
+  7602c5f70868d28e7730035e4e9d745b05d661c8f0a7eb758e63f9c8603596ef  seedvr2_7b_sharp_fp8_e4m3fn.safetensors  <- seedvr2_ema_7b_sharp.pth, fp8_e4m3fn + cond
+  db48be2f1cc7e36b01a2aa529810f5d9c6a971edd29be225cf1b0eb18d51c366  seedvr2_7b_sharp_int8.safetensors  <- seedvr2_ema_7b_sharp.pth, int8 + cond
+  0d621ec1561a11ca9b5f432ec6d4e09b263b61f4b83b0280552c8b4add030ec3  seedvr2_7b_sharp_mxfp8.safetensors  <- seedvr2_ema_7b_sharp.pth, mxfp8 + cond
+  80d57af7722f5a5bd4c01d2ab2688f2bf05e552e59d3d3287257de709db10397  seedvr2_7b_sharp_nvfp4.safetensors  <- seedvr2_ema_7b_sharp.pth, nvfp4 + cond
 """
 import argparse
 import collections
@@ -96,6 +117,9 @@ FP8 = torch.float8_e4m3fn
 NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
 NVFP4_ALIGNMENT = 32
 MXFP8_LAYOUT = "TensorCoreMXFP8Layout"
+INT8_LAYOUT = "TensorWiseINT8Layout"
+INT8_FORMAT = "int8_tensorwise"
+INT8_CONVROT_GROUPSIZE = 256  # power-of-4 Hadamard group size; in_features must be a multiple
 NVFP4_HIGH_RISK_PREFIXES = (
     "emb_in.",
     "txt_in.",
@@ -103,6 +127,7 @@ NVFP4_HIGH_RISK_PREFIXES = (
     "vid_out.",
 )
 MXFP8_HIGH_RISK_PREFIXES = NVFP4_HIGH_RISK_PREFIXES
+INT8_HIGH_RISK_PREFIXES = NVFP4_HIGH_RISK_PREFIXES
 
 
 def sha256(path):
@@ -124,25 +149,26 @@ def load_state_dict(pth):
     raise SystemExit(f"Unrecognized checkpoint structure: {type(obj)}")
 
 
-def comfy_quant_tensor(format_name):
-    return torch.tensor(list(json.dumps({"format": format_name}).encode("utf-8")), dtype=torch.uint8)
+def comfy_quant_tensor(format_name, extra=None):
+    conf = {"format": format_name}
+    if extra:
+        conf.update(extra)
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
 def roundup(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
 
 
-def detect_last_block_prefix(sd):
-    block_ids = []
-    for k in sd:
-        if not k.startswith("blocks."):
-            continue
-        parts = k.split(".", 2)
-        if len(parts) >= 2 and parts[1].isdigit():
-            block_ids.append(int(parts[1]))
-    if not block_ids:
-        return None
-    return f"blocks.{max(block_ids)}."
+def mixed_block35_prefix(sd):
+    # 3B vs 7B differentiation, matching the fp8 "mixed_block35_fp16" convention and the output
+    # filenames (seedvr2_3b_* carry no "mixed_block" suffix; seedvr2_7b_* do): only the 7B keeps
+    # its last DiT block (blocks.35) in fp16 to avoid line/tile artifacts. The 3B (last block
+    # blocks.31) quantizes every eligible block, exactly like the 3B fp8 checkpoint. Carve the
+    # block only when blocks.35 is present (the 7B); return None for the 3B.
+    if any(k.startswith("blocks.35.") for k in sd):
+        return "blocks.35."
+    return None
 
 
 def nvfp4_tensorcore_eligible(v):
@@ -151,20 +177,16 @@ def nvfp4_tensorcore_eligible(v):
     return roundup(v.shape[1], 16) % NVFP4_ALIGNMENT == 0
 
 
-def should_quantize_nvfp4(k, v, last_block_prefix):
+def should_quantize_nvfp4(k, v):
     if not k.endswith(".weight") or v.dim() != 2:
-        return False
-    if last_block_prefix and k.startswith(last_block_prefix):
         return False
     if k.startswith(NVFP4_HIGH_RISK_PREFIXES):
         return False
     return nvfp4_tensorcore_eligible(v)
 
 
-def should_quantize_mxfp8(k, v, last_block_prefix):
+def should_quantize_mxfp8(k, v):
     if not k.endswith(".weight") or v.dim() != 2:
-        return False
-    if last_block_prefix and k.startswith(last_block_prefix):
         return False
     if k.startswith(MXFP8_HIGH_RISK_PREFIXES):
         return False
@@ -199,6 +221,46 @@ def quantize_mxfp8_weight(k, v):
     return tensors
 
 
+def int8_convrot_eligible(v):
+    # ConvRot rotates along in_features in power-of-4 Hadamard groups; in_features must be a
+    # multiple of the group size or comfy_kitchen._rotate_weight raises.
+    if v.dim() != 2:
+        return False
+    return v.shape[1] % INT8_CONVROT_GROUPSIZE == 0
+
+
+def should_quantize_int8(k, v):
+    if not k.endswith(".weight") or v.dim() != 2:
+        return False
+    if k.startswith(INT8_HIGH_RISK_PREFIXES):
+        return False
+    return int8_convrot_eligible(v)
+
+
+def quantize_int8_weight(k, v):
+    try:
+        from comfy_kitchen.tensor import QuantizedTensor
+    except ImportError as e:
+        raise SystemExit("int8 precision requires comfy-kitchen") from e
+
+    base = k[:-len(".weight")]
+    # ConvRot weight rotation + rowwise INT8 quant route through comfy_kitchen CUDA kernels.
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    qt = QuantizedTensor.from_float(
+        v.contiguous().to(dev),
+        INT8_LAYOUT,
+        is_weight=True,
+        per_channel=True,
+        convrot=True,
+        convrot_groupsize=INT8_CONVROT_GROUPSIZE,
+    )
+    tensors = {key: t.detach().to("cpu").contiguous() for key, t in qt.state_dict(f"{base}.weight").items()}
+    tensors[f"{base}.comfy_quant"] = comfy_quant_tensor(
+        INT8_FORMAT, {"convrot": True, "convrot_groupsize": INT8_CONVROT_GROUPSIZE}
+    )
+    return tensors
+
+
 def cast(sd, precision):
     out = {}
     nvfp4_quantized = 0
@@ -208,7 +270,11 @@ def cast(sd, precision):
     mxfp8_quantized = 0
     mxfp8_kept_fp16 = 0
     mxfp8_kept_policy = 0
-    last_block_prefix = detect_last_block_prefix(sd)
+    int8_quantized = 0
+    int8_kept_fp16 = 0
+    int8_kept_policy = 0
+    int8_kept_shape = 0
+    last_block_prefix = mixed_block35_prefix(sd)
     for k, v in sd.items():
         if not torch.is_tensor(v):
             continue
@@ -219,7 +285,7 @@ def cast(sd, precision):
         elif precision == "fp8_e4m3fn_mixed_block35_fp16":
             out[k] = v.to(torch.float16) if k.startswith("blocks.35.") else v.to(FP8)
         elif precision == "nvfp4":
-            if should_quantize_nvfp4(k, v, last_block_prefix):
+            if should_quantize_nvfp4(k, v):
                 out.update(quantize_nvfp4_weight(k, v))
                 nvfp4_quantized += 1
             else:
@@ -228,34 +294,48 @@ def cast(sd, precision):
                 if k.endswith(".weight") and v.dim() == 2:
                     if not nvfp4_tensorcore_eligible(v):
                         nvfp4_kept_shape += 1
-                    elif last_block_prefix and k.startswith(last_block_prefix):
-                        nvfp4_kept_policy += 1
                     elif k.startswith(NVFP4_HIGH_RISK_PREFIXES):
                         nvfp4_kept_policy += 1
         elif precision == "mxfp8":
-            if should_quantize_mxfp8(k, v, last_block_prefix):
+            if should_quantize_mxfp8(k, v):
                 out.update(quantize_mxfp8_weight(k, v))
                 mxfp8_quantized += 1
             else:
                 out[k] = v.to(torch.float16)
                 mxfp8_kept_fp16 += 1
                 if k.endswith(".weight") and v.dim() == 2:
-                    if last_block_prefix and k.startswith(last_block_prefix):
+                    if k.startswith(MXFP8_HIGH_RISK_PREFIXES):
                         mxfp8_kept_policy += 1
-                    elif k.startswith(MXFP8_HIGH_RISK_PREFIXES):
-                        mxfp8_kept_policy += 1
+        elif precision == "int8":
+            if should_quantize_int8(k, v):
+                out.update(quantize_int8_weight(k, v))
+                int8_quantized += 1
+            else:
+                out[k] = v.to(torch.float16)
+                int8_kept_fp16 += 1
+                if k.endswith(".weight") and v.dim() == 2:
+                    if k.startswith(INT8_HIGH_RISK_PREFIXES):
+                        int8_kept_policy += 1
+                    elif not int8_convrot_eligible(v):
+                        int8_kept_shape += 1
         else:
             raise SystemExit(f"unknown precision: {precision}")
     if precision == "nvfp4":
         print(
             f"nvfp4 quantized_weights={nvfp4_quantized} kept_fp16={nvfp4_kept_fp16} "
             f"kept_policy={nvfp4_kept_policy} kept_shape={nvfp4_kept_shape} "
-            f"last_block={last_block_prefix or 'none'}"
+            f"last_block=quantized(full-model)"
         )
     if precision == "mxfp8":
         print(
             f"mxfp8 quantized_weights={mxfp8_quantized} kept_fp16={mxfp8_kept_fp16} "
-            f"kept_policy={mxfp8_kept_policy} last_block={last_block_prefix or 'none'}"
+            f"kept_policy={mxfp8_kept_policy} last_block=quantized(full-model)"
+        )
+    if precision == "int8":
+        print(
+            f"int8 quantized_weights={int8_quantized} kept_fp16={int8_kept_fp16} "
+            f"kept_policy={int8_kept_policy} kept_shape={int8_kept_shape} "
+            f"convrot_groupsize={INT8_CONVROT_GROUPSIZE} last_block=quantized(full-model)"
         )
     return out
 
