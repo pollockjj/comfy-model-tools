@@ -106,6 +106,11 @@ import json
 import torch
 from safetensors.torch import save_file
 
+# int8 quantization is delegated to comfy-quants' canonical stock-ComfyUI producer
+# (byte-matches ComfyUI's own save path), not comfy-kitchen from_float.
+from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
+from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
+
 FP8 = torch.float8_e4m3fn
 NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
 NVFP4_ALIGNMENT = 32
@@ -220,27 +225,19 @@ def should_quantize_int8(k, v):
 
 
 def quantize_int8_weight(k, v):
-    try:
-        from comfy_kitchen.tensor import QuantizedTensor
-    except ImportError as e:
-        raise SystemExit("int8 precision requires comfy-kitchen") from e
-
+    # Canonical stock-ComfyUI int8_tensorwise producer (comfy-quants), byte-matching
+    # ComfyUI's own save path — not comfy-kitchen from_float.
     base = k[:-len(".weight")]
-    # ConvRot weight rotation + rowwise INT8 quant route through comfy_kitchen CUDA kernels.
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    qt = QuantizedTensor.from_float(
-        v.contiguous().to(dev),
-        INT8_LAYOUT,
-        is_weight=True,
-        per_channel=True,
-        convrot=True,
-        convrot_groupsize=INT8_CONVROT_GROUPSIZE,
-    )
-    tensors = {key: t.detach().to("cpu").contiguous() for key, t in qt.state_dict(f"{base}.weight").items()}
-    tensors[f"{base}.comfy_quant"] = comfy_quant_tensor(
-        INT8_FORMAT, {"convrot": True, "convrot_groupsize": INT8_CONVROT_GROUPSIZE}
-    )
-    return tensors
+    qweight, scale, rotated = _quantize_int8_tensorwise_per_row(
+        v.contiguous().to(dev), convrot=True, group_size=INT8_CONVROT_GROUPSIZE)
+    marker = int8_tensorwise_checkpoint_quant_config(
+        convrot=rotated, convrot_groupsize=INT8_CONVROT_GROUPSIZE)
+    return {
+        f"{base}.weight": qweight.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale": scale.detach().to("cpu").contiguous(),
+        f"{base}.comfy_quant": torch.tensor(list(json.dumps(marker).encode("utf-8")), dtype=torch.uint8),
+    }
 
 
 def cast(sd, precision):

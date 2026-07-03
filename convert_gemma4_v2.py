@@ -53,7 +53,7 @@ text-encoder int8 policy.
 
 Outputs  ( sha256  file  <-  source, precision ):
   afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab  gemma4_e4b_it_bf16.safetensors  <- google/gemma-4-E4B-it, bf16  (byte-identical to the prior ComfyUI file)
-  <int8 sha filled after a verified comfy-quants run>  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8_tensorwise convrot (comfy-quants canonical; 380 language-model layers incl. both embeddings; vision+audio towers bf16)
+  21ee37c9650f8ec771fb00abccb352a1a021985591daa3962701a53b81888a5f  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8_tensorwise convrot (comfy-quants canonical producer; 380 language-model layers incl. both embeddings; vision+audio towers bf16; verified == direct producer)
 """
 import argparse
 import collections
