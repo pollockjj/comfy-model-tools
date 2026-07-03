@@ -2,67 +2,40 @@
 """
 Convert Gemma-4 (E2B / E4B) checkpoints to ComfyUI text-encoder safetensors.
 
-One source load serves every --job. The source may be a Hugging Face snapshot
-directory (config.json + model.safetensors + tokenizer.json) or an already-mapped
-ComfyUI bf16 safetensors; either way the bf16 ComfyUI layout is the base every job
-builds on. Output keys are the original ComfyUI text-encoder keys (safetensors sorts
-keys; no metadata). Quantized jobs emit native comfy_kitchen quantized-weight keys.
+V3 = V2 + int8 convrot. The bf16 and fp8_scaled jobs ARE V2's exact code, byte-identical
+to V2 (afe21e7c / bf0b4fa2 — the shipped Comfy-Org / prior ComfyUI files). The only
+addition over V2 is the int8 job. One source load serves every --job; the source may be a
+Hugging Face snapshot directory or an existing ComfyUI bf16 safetensors.
 
 Precisions:
-  bf16                          HF language_model/vision_tower/audio_tower/projectors
-                                remapped to ComfyUI keys, every float tensor -> bfloat16,
-                                KV-shared layer slots filled from the layer they share KV
-                                with, tokenizer.json embedded as the uint8 tensor
-                                `tokenizer_json`. This is the base for every other job.
-  fp8_e4m3fn                    every tensor -> float8_e4m3fn
-  int8                          language-model 2D .weight tensors (model.layers.* plus
-                                model.embed_tokens and model.embed_tokens_per_layer) ->
-                                stock-ComfyUI int8_tensorwise with ConvRot (per-channel
-                                scale + weight-dtype group-Hadamard rotation, groupsize 256)
-                                via comfy-quants _quantize_int8_tensorwise_per_row — the
-                                canonical producer that byte-matches stock ComfyUI's own
-                                save path. The vision tower, audio tower, and all projectors
-                                stay bfloat16; weights whose in_features is not a multiple of
-                                256 stay bfloat16.
+  bf16                          HF language/vision/audio/projector layout remapped to
+                                ComfyUI keys, kv-shared slots filled, tokenizer.json
+                                embedded. Every float tensor -> bfloat16. (identical to V2)
+  fp8_scaled                    Kijai Gemma-4 FP8 V1: language-model 2D .weight tensors
+                                with max(shape) >= 4096 (excluding norms) -> float8_e4m3fn,
+                                per-tensor scale = amax / 416. Everything else bf16. (identical to V2)
+  int8                          language-model 2D .weight tensors (in_features multiple of
+                                256; vision/audio towers + projectors excluded) -> stock-
+                                ComfyUI int8_tensorwise convrot (per-row scale + group-
+                                Hadamard rotation, groupsize 256) via comfy-quants
+                                _quantize_int8_tensorwise_per_row. int8 convrot is a
+                                torch.matmul, byte-reproducible only within one fixed
+                                environment; the canonical surface is interceptor CPU
+                                (--device cpu, CUDA_VISIBLE_DEVICES=).
 
 Examples:
-  # E4B: HF snapshot -> bf16 base and full-map int8 (one load serves both)
-  python convert_gemma4_v3.py --src ~/.cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots/<rev> \
-      --job bf16:gemma4_e4b_it_bf16.safetensors \
-      --job int8:gemma4_e4b_it_int8_convrot.safetensors
+  python convert_gemma4_v3.py --src <hf_dir_or_comfy_bf16> \
+      --job bf16:gemma4_e4b_it_bf16.safetensors:afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab \
+      --job fp8_scaled:gemma4_e4b_it_fp8_scaled.safetensors:bf0b4fa2e41a25684dc9e9b256cd505564f02fed09be3da95ce024e653e2c52b
 
-  # canonical int8 convrot off an existing ComfyUI bf16 file (interceptor CPU, self-verifying)
   CUDA_VISIBLE_DEVICES= python convert_gemma4_v3.py --device cpu --src gemma4_e4b_it_bf16.safetensors \
       --job int8:gemma4_e4b_it_int8_convrot.safetensors:065ea4422aa107c7133e9cf530582d6ba65057d089e35824e1d06da20960818c
 
-A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
-
-==========================================================================================
-Provenance
-==========================================================================================
-Source checkpoints (Gemma Terms of Use), pinned to the exact HuggingFace revision:
-
-  google/gemma-4-E4B-it   model.safetensors (bf16) + tokenizer.json + config.json
-  google/gemma-4-E2B-it   model.safetensors (bf16) + tokenizer.json + config.json
-
-int8 quantization is delegated to comfy-quants (comfy_quants.backends.
-int8_tensorwise_model_export._quantize_int8_tensorwise_per_row) — the stock-ComfyUI
-canonical producer — not comfy-kitchen from_float and not a hand-rolled quantizer. The
-language-model / vision+audio-tower split matches the established ComfyUI Gemma-4
-text-encoder int8 policy.
-
-int8 convrot rotation is a torch.matmul (Hadamard), so its float accumulation is
-compute-environment-specific and the output is byte-reproducible only within one fixed
-environment. The canonical surface is interceptor CPU (--device cpu, CUDA_VISIBLE_DEVICES=):
-verified byte-identical across two interceptor-CPU passes. A GPU run (--device cuda) is
-throwaway-speed only and produces a different, non-canonical sha.
-
-Outputs  ( sha256  file  <-  source, precision ):
-  afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab  gemma4_e4b_it_bf16.safetensors  <- google/gemma-4-E4B-it, bf16  (byte-identical to the prior ComfyUI file)
-  065ea4422aa107c7133e9cf530582d6ba65057d089e35824e1d06da20960818c  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8_tensorwise convrot (comfy-quants canonical producer; 380 language-model layers incl. both embeddings; vision+audio towers bf16; interceptor-CPU canonical, byte-reproducible)
+A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file. bf16
+and fp8_scaled are matmul-free (byte-identical on any machine); int8 convrot is interceptor-
+CPU canonical.
 """
 import argparse
-import collections
 import hashlib
 import json
 import os
@@ -71,17 +44,17 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-# Canonical quantization is comfy-quants (Comfy-Org's stock-ComfyUI-aligned offline
-# quantizer). We call its int8_tensorwise producer directly — NOT comfy-kitchen
-# from_float and NOT any hand-rolled path — so the int8 output byte-matches stock
-# ComfyUI's own save path (ops.py:_quantized_weight_state_dict).
+# int8 convrot is delegated to comfy-quants' stock-ComfyUI producer (byte-matches
+# ComfyUI's own save path). bf16 and fp8_scaled below are V2's exact code, untouched.
 from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
 from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
 
-FP8 = torch.float8_e4m3fn
-INT8_CONVROT_GROUPSIZE = 256  # power-of-4 Hadamard group; in_features must be a multiple
+FP8_DTYPE = torch.float8_e4m3fn
+FP8_INFO = torch.finfo(FP8_DTYPE)
+FP8_MAX = 416.0  # Kijai Gemma-4 FP8 V1 convention
+FP8_CONF = {"format": "float8_e4m3fn", "full_precision_matrix_mult": False}
+INT8_CONVROT_GROUPSIZE = 256
 
-# HF -> ComfyUI text-encoder key prefixes.
 PREFIX_MAP = [
     ("model.language_model.", "model."),
     ("model.audio_tower.", "audio_model."),
@@ -90,14 +63,8 @@ PREFIX_MAP = [
     ("model.embed_vision.", "multi_modal_projector."),
 ]
 
-# int8 policy: quantize the language model only. The vision tower, audio tower, and
-# projectors stay bf16 ("keep the vision and audio towers in fp16, the rest goes int8").
-INT8_KEEP_PREFIXES = (
-    "vision_model.",
-    "audio_model.",
-    "audio_projector.",
-    "multi_modal_projector.",
-)
+# int8 policy: language model only; vision/audio towers + projectors stay bf16.
+INT8_KEEP_PREFIXES = ("vision_model.", "audio_model.", "audio_projector.", "multi_modal_projector.")
 INT8_KEEP_EXACT = ("model.per_layer_model_projection",)
 
 
@@ -109,6 +76,10 @@ def sha256(path):
     return h.hexdigest()
 
 
+def marker_tensor(conf):
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+
+
 def map_key(key):
     for src, dst in PREFIX_MAP:
         if key.startswith(src):
@@ -118,9 +89,7 @@ def map_key(key):
 
 def kv_share_sources(cfg):
     tc = cfg.get("text_config", cfg)
-    n = tc["num_hidden_layers"]
-    shared = tc["num_kv_shared_layers"]
-    types = tc["layer_types"]
+    n, shared, types = tc["num_hidden_layers"], tc["num_kv_shared_layers"], tc["layer_types"]
     first_shared = n - shared
     last_of_type = {}
     for i in range(first_shared):
@@ -129,7 +98,6 @@ def kv_share_sources(cfg):
 
 
 def load_base(src):
-    """Return the ComfyUI bf16 base state dict, from an HF snapshot dir or a .safetensors."""
     if os.path.isdir(src):
         cfg = json.load(open(os.path.join(src, "config.json")))
         out = {}
@@ -139,17 +107,14 @@ def load_base(src):
                 if t.dtype != torch.bfloat16 and t.is_floating_point():
                     t = t.to(torch.bfloat16)
                 out[map_key(key)] = t
-        filled = 0
         for shared_idx, src_idx in kv_share_sources(cfg).items():
             for leaf in ("self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"):
-                dst_key = f"model.layers.{shared_idx}.{leaf}"
-                if dst_key not in out:
-                    out[dst_key] = out[f"model.layers.{src_idx}.{leaf}"].clone()
-                    filled += 1
+                dst = f"model.layers.{shared_idx}.{leaf}"
+                if dst not in out:
+                    out[dst] = out[f"model.layers.{src_idx}.{leaf}"].clone()
         tok = open(os.path.join(src, "tokenizer.json"), "rb").read()
         out["tokenizer_json"] = torch.tensor(list(tok), dtype=torch.uint8)
-        print(f"mapped HF snapshot: {len(out)} tensors, filled {filled} kv-shared slots, "
-              f"tokenizer {len(tok)} bytes")
+        print(f"mapped HF snapshot: {len(out)} tensors, tokenizer {len(tok)} bytes")
         return out
     out = {}
     with safe_open(src, framework="pt", device="cpu") as st:
@@ -159,10 +124,22 @@ def load_base(src):
     return out
 
 
-def marker_tensor(conf):
-    # Encode the comfy_quant marker exactly like stock ComfyUI's save path: default
-    # json.dumps separators + insertion order (comfy-quants' _marker_tensor).
-    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+def should_quantize_fp8_scaled(k, v):
+    # Kijai Gemma-4 FP8 V1 selection: large language-model 2D linears.
+    return (k.startswith("model.") and k.endswith(".weight") and v.dim() == 2
+            and "norm" not in k and max(v.shape) >= 4096)
+
+
+def quantize_fp8_scaled_weight(k, v):
+    base = k[:-len(".weight")]
+    w = v.float()
+    scale = torch.max(torch.abs(w)) / FP8_MAX
+    q = (w / scale).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(FP8_DTYPE)
+    return {
+        f"{base}.weight": q.cpu().contiguous(),
+        f"{base}.weight_scale": scale.cpu(),
+        f"{base}.comfy_quant": marker_tensor(FP8_CONF),
+    }
 
 
 def int8_convrot_eligible(k, v):
@@ -191,51 +168,42 @@ def quantize_int8_weight(k, v, dev):
 
 def cast(sd, precision, device="cpu"):
     out = {}
-    int8_quantized = int8_kept_policy = int8_kept_shape = 0
+    nq = 0
     for k, v in sd.items():
         if not torch.is_tensor(v):
             continue
         if precision == "bf16":
             out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
-        elif precision == "fp8_e4m3fn":
-            out[k] = v.to(FP8) if v.is_floating_point() else v
-        elif precision == "int8":
-            if int8_convrot_eligible(k, v):
-                out.update(quantize_int8_weight(k, v, device))
-                int8_quantized += 1
+        elif precision == "fp8_scaled":
+            if should_quantize_fp8_scaled(k, v):
+                out.update(quantize_fp8_scaled_weight(k, v)); nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
-                if k.endswith(".weight") and v.dim() == 2:
-                    if k.startswith(INT8_KEEP_PREFIXES) or k[:-len(".weight")] in INT8_KEEP_EXACT:
-                        int8_kept_policy += 1
-                    elif v.shape[1] % INT8_CONVROT_GROUPSIZE != 0:
-                        int8_kept_shape += 1
+        elif precision == "int8":
+            if int8_convrot_eligible(k, v):
+                out.update(quantize_int8_weight(k, v, device)); nq += 1
+            else:
+                out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
         else:
             raise SystemExit(f"unknown precision: {precision}")
+    if precision == "fp8_scaled":
+        print(f"fp8_scaled: quantized {nq} weights")
     if precision == "int8":
-        print(f"int8 quantized_weights={int8_quantized} kept_policy={int8_kept_policy} "
-              f"kept_shape={int8_kept_shape} convrot_groupsize={INT8_CONVROT_GROUPSIZE}")
+        print(f"int8: quantized {nq} weights (convrot groupsize {INT8_CONVROT_GROUPSIZE})")
     return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert Gemma-4 to ComfyUI text-encoder safetensors.")
+    ap = argparse.ArgumentParser(description="Convert Gemma-4 to ComfyUI safetensors (V3 = V2 + int8 convrot).")
     ap.add_argument("--src", required=True, help="HF snapshot dir or a ComfyUI bf16 safetensors")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
-    ap.add_argument("--dump", action="store_true", help="print base tensor count and dtypes")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
-                    help="int8 convrot quantization device; cpu is the canonical byte-reproducible "
-                         "target (interceptor-CPU mandate), cuda is throwaway-speed only and must "
-                         "never produce a provenance artifact")
+                    help="int8 convrot device; cpu is the canonical byte-reproducible target "
+                         "(interceptor-CPU mandate), cuda is throwaway-speed only")
     args = ap.parse_args()
 
     base = load_base(args.src)
-
-    if args.dump:
-        dtypes = collections.Counter(str(v.dtype) for v in base.values() if torch.is_tensor(v))
-        print(f"{len(base)} tensors, dtypes={dict(dtypes)}")
-
     mismatched = []
     for job in args.job:
         precision, sep, remainder = job.partition(":")

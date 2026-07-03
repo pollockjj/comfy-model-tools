@@ -2,54 +2,38 @@
 """
 Convert DiffusionGemma-26B-A4B checkpoints to ComfyUI text-encoder safetensors.
 
-One source load serves every --job. The source may be a Hugging Face snapshot
-directory (11 model-*-of-*.safetensors shards + config.json + tokenizer.json) or an
-already-mapped ComfyUI bf16 safetensors; either way the bf16 ComfyUI layout is the
-base every job builds on. Output keys are the ComfyUI text-encoder keys (safetensors
-sorts keys; no metadata). Quantized jobs emit native comfy_kitchen quantized-weight
-keys.
+V3 = V2 + int8 convrot. DiffusionGemma's int8 convrot job is NOT built yet — its 3D MoE
+expert banks have no comfy-quants routine (a separate build) — so V3 currently carries
+only the bf16 and fp8 jobs and is byte-identical to V2 (495d347e / 3d26c504). The bf16 and
+fp8 code below is V2's exact code; when the int8 job lands it is added alongside, leaving
+bf16/fp8 untouched.
+
+Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
+is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
+tokenizer.json. lm_head.* is dropped.
 
 Precisions:
-  bf16                          HF shards remapped to ComfyUI keys (lm_head dropped,
-                                expert banks suffixed .weight), every float tensor ->
-                                bfloat16, tokenizer.json embedded as `tokenizer_json`.
-                                This is the base for every other job.
-  fp8_e4m3fn                    per-token 2D Linear weights (attention q/k/v/o_proj and
-                                dense gate/up/down_proj) -> float8_e4m3fn via comfy_kitchen
-                                QuantizedTensor.from_float; the 3D grouped expert banks ->
-                                per-expert absmax float8_e4m3fn (one scale per expert).
-                                Embeddings, router, self-conditioning, vision encoder,
-                                norms/scalars, and the tokenizer stay bfloat16.
+  bf16                          every float tensor -> bfloat16; expert banks -> <bank>.weight.
+  fp8                           Kijai FP8 V1 (max_value=416): expert banks (3D) -> float8_e4m3fn
+                                with per-expert scale (amax over dims 1,2 / 416); large 2D
+                                text-backbone weights (model.decoder.layers.*, max(shape) >= 4096,
+                                non-norm) -> float8_e4m3fn per-tensor scale (amax / 416).
+                                Everything else -> bfloat16.
 
 Examples:
-  # HF snapshot -> bf16 base and fp8
   python convert_diffusiongemma_v2.py \
       --src ~/.cache/huggingface/hub/models--google--diffusiongemma-26B-A4B-it/snapshots/<rev> \
-      --job bf16:diffusiongemma_comfy_bf16.safetensors \
-      --job fp8_e4m3fn:diffusiongemma_comfy_fp8.safetensors
-
-  # quantize straight off an existing ComfyUI bf16 file
-  python convert_diffusiongemma_v2.py --src diffusiongemma_comfy_bf16.safetensors \
-      --job fp8_e4m3fn:diffusiongemma_comfy_fp8.safetensors
+      --job bf16:diffusiongemma_comfy_bf16.safetensors:495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1 \
+      --job fp8:diffusiongemma_comfy_fp8.safetensors:3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
 
-==========================================================================================
-Provenance
-==========================================================================================
-Source checkpoint (Gemma Terms of Use), pinned to the exact HuggingFace revision:
-
-  google/diffusiongemma-26B-A4B-it @ 0f28bc42f588fbd8f71e08102b1c3960298a1358
-    11 shards + config.json + tokenizer.json; 30 decoder layers, 128 experts.
-
-fp8 uses comfy_kitchen QuantizedTensor.from_float for 2D Linear weights (the documented
-canonical kernel) and per-expert absmax fp8 for the 3D grouped expert banks.
-
-Outputs  ( sha256  file  <-  source, precision ):
-  495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1  diffusiongemma_comfy_bf16.safetensors  <- google/diffusiongemma-26B-A4B-it, bf16  (byte-identical to the prior ComfyUI file)
+Reproducibility: both jobs are matmul-free (bf16 passthrough; fp8 is per-expert / per-tensor
+amax/416, elementwise), so output is byte-identical on any machine/device. Verified on
+interceptor CPU: bf16 495d347e and fp8 3d26c504 both match the shipped HF files exactly.
 """
 import argparse
-import collections
+import glob
 import hashlib
 import json
 import os
@@ -58,24 +42,11 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-# 2D fp8 quantization is delegated to comfy-quants' canonical stock-ComfyUI producer,
-# NOT comfy-kitchen from_float. The 3D grouped expert banks have NO comfy-quants routine
-# (comfy-quants is 2D-only), so per-expert absmax fp8 for them stays here — the one
-# documented non-viable case.
-from comfy_quants.backends.inference_model_export import _quantize_float8, _unit_input_scale_tensor
-from comfy_quants.formats.fp8_common import fp8_checkpoint_quant_config
-
-FP8_FORMAT = "float8_e4m3fn"
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_INFO = torch.finfo(FP8_DTYPE)
-
-EXPECTED_SHARDS = 11
-EXPECTED_LAYERS = 30
-EXPECTED_EXPERTS = 128
+FP8_MAX = 416.0  # Kijai DiffusionGemma FP8 V1 convention
 EXPERT_HF_SUFFIXES = (".experts.gate_up_proj", ".experts.down_proj")
-EXPERT_COMFY_SUFFIXES = (".experts.gate_up_proj.weight", ".experts.down_proj.weight")
-ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
-MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+EXPERT_WEIGHT_SUFFIXES = (".experts.gate_up_proj.weight", ".experts.down_proj.weight")
 
 
 def sha256(path):
@@ -86,136 +57,98 @@ def sha256(path):
     return h.hexdigest()
 
 
-def normalize_hf_key(key):
-    if key.startswith("lm_head."):
-        return None
-    if key.endswith(EXPERT_HF_SUFFIXES):
-        return f"{key}.weight"
-    return key
+def marker_tensor(conf):
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
 def load_base(src):
-    """Return the ComfyUI bf16 base state dict, from an HF snapshot dir or a .safetensors."""
-    if os.path.isdir(src):
-        cfg = json.load(open(os.path.join(src, "config.json")))
-        tc = cfg.get("text_config", {})
-        if tc.get("num_hidden_layers") != EXPECTED_LAYERS or tc.get("num_experts") != EXPECTED_EXPERTS:
-            raise SystemExit(f"unexpected DG config: layers={tc.get('num_hidden_layers')} "
-                             f"experts={tc.get('num_experts')}")
-        shards = sorted(__import__("glob").glob(os.path.join(src, "model-*-of-*.safetensors")))
-        if len(shards) != EXPECTED_SHARDS:
-            raise SystemExit(f"expected {EXPECTED_SHARDS} HF shards, found {len(shards)}")
+    if not os.path.isdir(src):
         out = {}
-        for shard in shards:
-            with safe_open(shard, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    out_key = normalize_hf_key(key)
-                    if out_key is None:
-                        continue
-                    if out_key in out:
-                        raise SystemExit(f"duplicate output key after HF mapping: {out_key}")
-                    out[out_key] = f.get_tensor(key)
-        tok = open(os.path.join(src, "tokenizer.json"), "rb").read()
-        out["tokenizer_json"] = torch.tensor(list(tok), dtype=torch.uint8)
-        print(f"mapped HF snapshot: {len(out)} tensors, {len(shards)} shards, tokenizer {len(tok)} bytes")
+        with safe_open(src, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                out[key] = f.get_tensor(key)
+        print(f"loaded ComfyUI bf16 base: {len(out)} tensors")
         return out
+    shards = sorted(glob.glob(os.path.join(src, "model-*-of-*.safetensors")))
+    if not shards:
+        raise SystemExit(f"no shards found in {src}")
     out = {}
-    with safe_open(src, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            out[key] = f.get_tensor(key)
-    print(f"loaded ComfyUI bf16 base: {len(out)} tensors")
+    for shard in shards:
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                if k.startswith("lm_head."):
+                    continue
+                out_key = f"{k}.weight" if k.endswith(EXPERT_HF_SUFFIXES) else k
+                out[out_key] = f.get_tensor(k)
+    tok = open(os.path.join(src, "tokenizer.json"), "rb").read()
+    out["tokenizer_json"] = torch.tensor(list(tok), dtype=torch.uint8)
+    print(f"mapped HF snapshot: {len(out)} tensors, {len(shards)} shards, tokenizer {len(tok)} bytes")
     return out
 
 
-def comfy_quant_tensor(conf):
-    return torch.tensor(list(json.dumps(conf, sort_keys=True).encode("utf-8")), dtype=torch.uint8)
+def is_expert_bank(k):
+    return k.endswith(EXPERT_WEIGHT_SUFFIXES)
 
 
-def is_expert_bank(key):
-    return key.endswith(EXPERT_COMFY_SUFFIXES)
+def should_quantize_2d(k, v):
+    return (k.startswith("model.decoder.layers.") and k.endswith(".weight") and v.dim() == 2
+            and "norm" not in k and max(v.shape) >= 4096)
 
 
-def is_attn_or_mlp_2d(key):
-    if not key.startswith("model.decoder.layers.") or not key.endswith(".weight"):
-        return False
-    return (any(f".self_attn.{n}.weight" in key for n in ATTN_PROJECTIONS)
-            or any(f".mlp.{n}.weight" in key for n in MLP_PROJECTIONS))
-
-
-def quantize_2d_fp8(key, tensor):
-    # comfy-quants canonical per-tensor fp8 (weight, weight_scale, unit input_scale, marker).
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    qweight, scale = _quantize_float8(
-        tensor.contiguous().to(dev), target_dtype="fp8_e4m3",
-        scale_granularity="per_tensor", scale_axis=None, rounding="nearest_even")
-    layer = key[:-len(".weight")]
+def quantize_bank(k, w):
+    base = k[:-len(".weight")]
+    w = w.float()
+    scale = torch.amax(torch.abs(w), dim=(1, 2)) / FP8_MAX
+    w_q = (w / scale[:, None, None]).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(FP8_DTYPE)
     return {
-        key: qweight.detach().to("cpu").contiguous(),
-        f"{layer}.weight_scale": scale.detach().to("cpu").contiguous(),
-        f"{layer}.input_scale": _unit_input_scale_tensor(device="cpu"),
-        f"{layer}.comfy_quant": comfy_quant_tensor(fp8_checkpoint_quant_config("fp8_e4m3")),
+        f"{base}.weight": w_q,
+        f"{base}.weight_scale": scale,
+        f"{base}.comfy_quant": marker_tensor({"format": "float8_e4m3fn", "num_experts": w.shape[0]}),
     }
 
 
-def quantize_expert_bank(key, tensor):
-    if tensor.dim() != 3 or tensor.shape[0] != EXPECTED_EXPERTS:
-        raise SystemExit(f"expert bank {key} not [E,*,*] with E={EXPECTED_EXPERTS}: {tuple(tensor.shape)}")
-    qdata = torch.empty(tensor.shape, dtype=FP8_DTYPE)
-    scales = torch.empty((tensor.shape[0],), dtype=torch.float32)
-    for e in range(tensor.shape[0]):
-        expert = tensor[e].float()
-        scale = torch.amax(expert.abs()) / FP8_INFO.max
-        if scale.item() == 0:
-            raise SystemExit(f"zero fp8 scale for {key} expert {e}")
-        scales[e] = scale
-        qdata[e] = (expert / scale).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(FP8_DTYPE)
+def quantize_2d(k, w):
+    base = k[:-len(".weight")]
+    w = w.float()
+    scale = torch.max(torch.abs(w)) / FP8_MAX
+    w_q = (w / scale).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(FP8_DTYPE)
     return {
-        key: qdata,
-        key.replace(".weight", ".weight_scale"): scales,
-        key.replace(".weight", ".comfy_quant"): comfy_quant_tensor(
-            {"format": FP8_FORMAT, "num_experts": tensor.shape[0], "scale_granularity": "per_expert"}),
+        f"{base}.weight": w_q,
+        f"{base}.weight_scale": scale,
+        f"{base}.comfy_quant": marker_tensor({"format": "float8_e4m3fn"}),
     }
 
 
 def cast(sd, precision):
     out = {}
-    q2d = qexp = kept = 0
+    nq = 0
     for k, v in sd.items():
         if not torch.is_tensor(v):
             continue
         if precision == "bf16":
             out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
-        elif precision == "fp8_e4m3fn":
+        elif precision == "fp8":
             if is_expert_bank(k):
-                out.update(quantize_expert_bank(k, v)); qexp += 1
-            elif is_attn_or_mlp_2d(k):
-                out.update(quantize_2d_fp8(k, v)); q2d += 1
+                out.update(quantize_bank(k, v)); nq += 1
+            elif should_quantize_2d(k, v):
+                out.update(quantize_2d(k, v)); nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
-                kept += 1
         else:
             raise SystemExit(f"unknown precision: {precision}")
-    if precision == "fp8_e4m3fn":
-        if qexp != EXPECTED_LAYERS * 2:
-            raise SystemExit(f"expert coverage {qexp} != {EXPECTED_LAYERS * 2}")
-        print(f"fp8_e4m3fn expert_banks={qexp} linear2d={q2d} kept_bf16={kept}")
+    if precision == "fp8":
+        print(f"fp8: quantized {nq} weights")
     return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert DiffusionGemma to ComfyUI text-encoder safetensors.")
+    ap = argparse.ArgumentParser(description="Convert DiffusionGemma to ComfyUI safetensors (V2, Kijai conversion).")
     ap.add_argument("--src", required=True, help="HF snapshot dir or a ComfyUI bf16 safetensors")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
-    ap.add_argument("--dump", action="store_true", help="print base tensor count and dtypes")
     args = ap.parse_args()
 
     base = load_base(args.src)
-    if args.dump:
-        dtypes = collections.Counter(str(v.dtype) for v in base.values() if torch.is_tensor(v))
-        experts = sum(1 for k in base if is_expert_bank(k))
-        print(f"{len(base)} tensors, dtypes={dict(dtypes)}, expert_banks={experts}")
-
     mismatched = []
     for job in args.job:
         precision, sep, remainder = job.partition(":")
