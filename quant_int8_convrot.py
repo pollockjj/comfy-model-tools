@@ -89,10 +89,11 @@ def open_model(path):
 EXCLUDE_SEG = re.compile(
     r"scale_shift|rope|rotary|rel_pos|pos_?embed|embedder|"
     r"gate_logits|router|routing|logit|temperature|"
-    r"(?:^|_)time|temb|t_emb|guidance|register|refiner_blocks|"
+    r"(?:^|_)time|temb|t_emb|guidance|register|refiner_blocks|adapter|"
     r"(?:^|_)(?:final|head|proj_out|out_layer)(?:_|$)")
-# `refiner_blocks` = the short-M text side-path (Krea txtfusion.refiner_blocks). Main-stream refiners
-# are named `*_refiner` (Boogu/Z-Image noise/context/ref_image), so they're kept.
+# `refiner_blocks` = short-M text side-path (Krea txtfusion.refiner_blocks); main-stream refiners are
+# `*_refiner` (Boogu/Z-Image), kept. `adapter` = conditioning injection modules (Wan-Animate
+# face_adapter, ip/control adapters): tiny, identity/quality-critical, quantize worst -> leave bf16.
 
 def classify(key, shape):
     """Quantize every eligible 2-D block linear except the name denylist. Returns (bool, reason)."""
@@ -110,7 +111,7 @@ def classify(key, shape):
     if not any(segs[i].isdigit() for i in range(len(segs) - 1)):
         return (False, "not-in-indexed-block")
     if any(EXCLUDE_SEG.search(s) for s in segs):
-        return (False, "denylist(scale_shift/embed/gate/time/head/refiner_blocks)")
+        return (False, "denylist(scale_shift/embed/gate/time/head/refiner_blocks/adapter)")
     return (True, f"gs{gs}")
 
 # ---------------------------------------------------------------------------
