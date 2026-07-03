@@ -27,13 +27,13 @@ Precisions:
 
 Examples:
   # E4B: HF snapshot -> bf16 base and full-map int8 (one load serves both)
-  python convert_gemma4_v2.py --src ~/.cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots/<rev> \
+  python convert_gemma4_v3.py --src ~/.cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots/<rev> \
       --job bf16:gemma4_e4b_it_bf16.safetensors \
       --job int8:gemma4_e4b_it_int8_convrot.safetensors
 
-  # quantize straight off an existing ComfyUI bf16 file
-  python convert_gemma4_v2.py --src gemma4_e4b_it_bf16.safetensors \
-      --job int8:gemma4_e4b_it_int8_convrot.safetensors
+  # canonical int8 convrot off an existing ComfyUI bf16 file (interceptor CPU, self-verifying)
+  CUDA_VISIBLE_DEVICES= python convert_gemma4_v3.py --device cpu --src gemma4_e4b_it_bf16.safetensors \
+      --job int8:gemma4_e4b_it_int8_convrot.safetensors:065ea4422aa107c7133e9cf530582d6ba65057d089e35824e1d06da20960818c
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
 
@@ -51,9 +51,15 @@ canonical producer — not comfy-kitchen from_float and not a hand-rolled quanti
 language-model / vision+audio-tower split matches the established ComfyUI Gemma-4
 text-encoder int8 policy.
 
+int8 convrot rotation is a torch.matmul (Hadamard), so its float accumulation is
+compute-environment-specific and the output is byte-reproducible only within one fixed
+environment. The canonical surface is interceptor CPU (--device cpu, CUDA_VISIBLE_DEVICES=):
+verified byte-identical across two interceptor-CPU passes. A GPU run (--device cuda) is
+throwaway-speed only and produces a different, non-canonical sha.
+
 Outputs  ( sha256  file  <-  source, precision ):
   afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab  gemma4_e4b_it_bf16.safetensors  <- google/gemma-4-E4B-it, bf16  (byte-identical to the prior ComfyUI file)
-  21ee37c9650f8ec771fb00abccb352a1a021985591daa3962701a53b81888a5f  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8_tensorwise convrot (comfy-quants canonical producer; 380 language-model layers incl. both embeddings; vision+audio towers bf16; verified == direct producer)
+  065ea4422aa107c7133e9cf530582d6ba65057d089e35824e1d06da20960818c  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8_tensorwise convrot (comfy-quants canonical producer; 380 language-model layers incl. both embeddings; vision+audio towers bf16; interceptor-CPU canonical, byte-reproducible)
 """
 import argparse
 import collections
