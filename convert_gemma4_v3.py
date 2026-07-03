@@ -170,9 +170,8 @@ def int8_convrot_eligible(k, v):
     return not k.startswith(INT8_KEEP_PREFIXES)
 
 
-def quantize_int8_weight(k, v):
+def quantize_int8_weight(k, v, dev):
     base = k[:-len(".weight")]
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
     qweight, scale, rotated = _quantize_int8_tensorwise_per_row(
         v.contiguous().to(dev), convrot=True, group_size=INT8_CONVROT_GROUPSIZE)
     marker = int8_tensorwise_checkpoint_quant_config(
@@ -184,7 +183,7 @@ def quantize_int8_weight(k, v):
     }
 
 
-def cast(sd, precision):
+def cast(sd, precision, device="cpu"):
     out = {}
     int8_quantized = int8_kept_policy = int8_kept_shape = 0
     for k, v in sd.items():
@@ -196,7 +195,7 @@ def cast(sd, precision):
             out[k] = v.to(FP8) if v.is_floating_point() else v
         elif precision == "int8":
             if int8_convrot_eligible(k, v):
-                out.update(quantize_int8_weight(k, v))
+                out.update(quantize_int8_weight(k, v, device))
                 int8_quantized += 1
             else:
                 out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
@@ -219,6 +218,10 @@ def main():
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
     ap.add_argument("--dump", action="store_true", help="print base tensor count and dtypes")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                    help="int8 convrot quantization device; cpu is the canonical byte-reproducible "
+                         "target (interceptor-CPU mandate), cuda is throwaway-speed only and must "
+                         "never produce a provenance artifact")
     args = ap.parse_args()
 
     base = load_base(args.src)
@@ -236,7 +239,7 @@ def main():
         head, sha_sep, tail = remainder.rpartition(":")
         if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
             out, expected = head, tail.lower()
-        tensors = cast(base, precision)
+        tensors = cast(base, precision, args.device)
         save_file(tensors, out)
         digest = sha256(out)
         verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
