@@ -24,9 +24,13 @@ Examples:
   python convert_diffusiongemma_v2.py \
       --src ~/.cache/huggingface/hub/models--google--diffusiongemma-26B-A4B-it/snapshots/<rev> \
       --job bf16:diffusiongemma_comfy_bf16.safetensors:495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1 \
-      --job fp8:diffusiongemma_comfy_fp8.safetensors
+      --job fp8:diffusiongemma_comfy_fp8.safetensors:3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
+
+Reproducibility: both jobs are matmul-free (bf16 passthrough; fp8 is per-expert / per-tensor
+amax/416, elementwise), so output is byte-identical on any machine/device. Verified on
+interceptor CPU: bf16 495d347e and fp8 3d26c504 both match the shipped HF files exactly.
 """
 import argparse
 import glob

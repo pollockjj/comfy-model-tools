@@ -26,9 +26,17 @@ Examples:
   python convert_gemma4_v2.py --src <hf_dir_or_comfy_bf16> \
       --job bf16:gemma4_e4b_it_bf16.safetensors:afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab \
       --job fp8_scaled:gemma4_e4b_it_fp8_scaled.safetensors:bf0b4fa2e41a25684dc9e9b256cd505564f02fed09be3da95ce024e653e2c52b \
-      --job int8_convrot:gemma4_e4b_it_int8_convrot.safetensors:921326711aba59eefcab7cedf839bedcf0e14556d5baa3b05daad6cd57fb88a7
+      --job int8_convrot:gemma4_e4b_it_int8_convrot.safetensors:057cbe0afd7fd30a56e7dddf526a0737558f278bb48e108e1cbd76b99571818b
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
+
+Reproducibility: bf16 and fp8_scaled are matmul-free (elementwise) and therefore
+byte-identical on any machine/device (bf16 afe21e7c, fp8_scaled bf0b4fa2 match the prior
+HF files). int8_convrot routes through the convrot rotation matmul, whose float
+accumulation is compute-environment-specific: 4 environments produced 4 distinct shas
+(avenger-5090 921326711, interceptor-3090 5fca0726, interceptor-CPU 057cbe0a,
+firestorm-CPU d1d8f9ba). Per CLAUDE.md the canonical conversion runs on interceptor CPU,
+so the canonical int8 sha is 057cbe0a; the older HF 921326711 is a superseded 5090 artifact.
 """
 import argparse
 import collections
