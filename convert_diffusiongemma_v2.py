@@ -58,7 +58,13 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-FP8_LAYOUT = "TensorCoreFP8Layout"
+# 2D fp8 quantization is delegated to comfy-quants' canonical stock-ComfyUI producer,
+# NOT comfy-kitchen from_float. The 3D grouped expert banks have NO comfy-quants routine
+# (comfy-quants is 2D-only), so per-expert absmax fp8 for them stays here — the one
+# documented non-viable case.
+from comfy_quants.backends.inference_model_export import _quantize_float8, _unit_input_scale_tensor
+from comfy_quants.formats.fp8_common import fp8_checkpoint_quant_config
+
 FP8_FORMAT = "float8_e4m3fn"
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_INFO = torch.finfo(FP8_DTYPE)
@@ -137,14 +143,18 @@ def is_attn_or_mlp_2d(key):
 
 
 def quantize_2d_fp8(key, tensor):
-    try:
-        from comfy_kitchen.tensor import QuantizedTensor
-    except ImportError as e:
-        raise SystemExit("fp8_e4m3fn requires comfy-kitchen") from e
-    qt = QuantizedTensor.from_float(tensor.contiguous(), FP8_LAYOUT)
-    tensors = qt.state_dict(key)
-    tensors[key.replace(".weight", ".comfy_quant")] = comfy_quant_tensor({"format": FP8_FORMAT})
-    return tensors
+    # comfy-quants canonical per-tensor fp8 (weight, weight_scale, unit input_scale, marker).
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    qweight, scale = _quantize_float8(
+        tensor.contiguous().to(dev), target_dtype="fp8_e4m3",
+        scale_granularity="per_tensor", scale_axis=None, rounding="nearest_even")
+    layer = key[:-len(".weight")]
+    return {
+        key: qweight.detach().to("cpu").contiguous(),
+        f"{layer}.weight_scale": scale.detach().to("cpu").contiguous(),
+        f"{layer}.input_scale": _unit_input_scale_tensor(device="cpu"),
+        f"{layer}.comfy_quant": comfy_quant_tensor(fp8_checkpoint_quant_config("fp8_e4m3")),
+    }
 
 
 def quantize_expert_bank(key, tensor):

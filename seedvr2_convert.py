@@ -106,10 +106,16 @@ import json
 import torch
 from safetensors.torch import save_file
 
-# int8 quantization is delegated to comfy-quants' canonical stock-ComfyUI producer
-# (byte-matches ComfyUI's own save path), not comfy-kitchen from_float.
+# All weight quantization is delegated to comfy-quants' canonical stock-ComfyUI
+# producers (bit-faithful to comfy-kitchen eager / byte-matching ComfyUI's own save
+# path), NOT comfy-kitchen from_float. fp8_e4m3fn stays a plain dtype cast — a naive
+# storage cast has no comfy-quants scaled-fp8 equivalent, so it is not delegated.
 from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
 from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
+from comfy_quants.formats.nvfp4_blocked import quantize_nvfp4_block, BLOCK_SIZE as NVFP4_BLOCK
+from comfy_quants.formats.nvfp4 import nvfp4_checkpoint_quant_config
+from comfy_quants.formats.mxfp8_blocked import quantize_mxfp8_block, BLOCK_SIZE as MXFP8_BLOCK
+from comfy_quants.formats.mxfp8 import mxfp8_checkpoint_quant_config
 
 FP8 = torch.float8_e4m3fn
 NVFP4_LAYOUT = "TensorCoreNVFP4Layout"
@@ -159,9 +165,10 @@ def roundup(x, multiple):
 
 
 def nvfp4_tensorcore_eligible(v):
+    # comfy-quants quantize_nvfp4_block requires in_features % 16 == 0 (block size).
     if v.dim() != 2:
         return False
-    return roundup(v.shape[1], 16) % NVFP4_ALIGNMENT == 0
+    return v.shape[1] % NVFP4_BLOCK == 0
 
 
 def should_quantize_nvfp4(k, v):
@@ -177,35 +184,35 @@ def should_quantize_mxfp8(k, v):
         return False
     if k.startswith(MXFP8_HIGH_RISK_PREFIXES):
         return False
-    return True
+    # comfy-quants quantize_mxfp8_block requires in_features % 32 == 0 (block size).
+    return v.shape[1] % MXFP8_BLOCK == 0
+
+
+def marker_tensor(conf):
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
 def quantize_nvfp4_weight(k, v):
-    try:
-        from comfy_kitchen.tensor import QuantizedTensor
-    except ImportError as e:
-        raise SystemExit("nvfp4 precision requires comfy-kitchen") from e
-
     base = k[:-len(".weight")]
-    qt = QuantizedTensor.from_float(v.contiguous(), NVFP4_LAYOUT)
-    tensors = qt.state_dict(f"{base}.weight")
-    tensors[f"{base}.comfy_quant"] = comfy_quant_tensor("nvfp4")
-    return tensors
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    qweight, weight_scale, weight_scale_2 = quantize_nvfp4_block(v.contiguous().to(dev))
+    return {
+        f"{base}.weight": qweight.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale": weight_scale.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale_2": weight_scale_2.detach().to("cpu").contiguous(),
+        f"{base}.comfy_quant": marker_tensor(nvfp4_checkpoint_quant_config()),
+    }
 
 
 def quantize_mxfp8_weight(k, v):
-    try:
-        from comfy_kitchen.tensor import QuantizedTensor
-    except ImportError as e:
-        raise SystemExit("mxfp8 precision requires comfy-kitchen") from e
-
     base = k[:-len(".weight")]
-    qt = QuantizedTensor.from_float(v.contiguous(), MXFP8_LAYOUT)
-    tensors = qt.state_dict(f"{base}.weight")
-    scale_key = f"{base}.weight_scale"
-    tensors[scale_key] = tensors[scale_key].view(torch.uint8)
-    tensors[f"{base}.comfy_quant"] = comfy_quant_tensor("mxfp8")
-    return tensors
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    qweight, weight_scale = quantize_mxfp8_block(v.contiguous().to(dev))
+    return {
+        f"{base}.weight": qweight.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale": weight_scale.detach().to("cpu").contiguous(),
+        f"{base}.comfy_quant": marker_tensor(mxfp8_checkpoint_quant_config()),
+    }
 
 
 def int8_convrot_eligible(v):
