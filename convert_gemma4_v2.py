@@ -17,11 +17,13 @@ Precisions:
   fp8_e4m3fn                    every tensor -> float8_e4m3fn
   int8                          language-model 2D .weight tensors (model.layers.* plus
                                 model.embed_tokens and model.embed_tokens_per_layer) ->
-                                TensorWiseINT8Layout with ConvRot (per-channel weight
-                                scale + group-wise Hadamard rotation, groupsize 256) via
-                                comfy_kitchen QuantizedTensor.from_float. The vision tower,
-                                audio tower, and all projectors stay bfloat16; weights whose
-                                in_features is not a multiple of 256 stay bfloat16.
+                                stock-ComfyUI int8_tensorwise with ConvRot (per-channel
+                                scale + weight-dtype group-Hadamard rotation, groupsize 256)
+                                via comfy-quants _quantize_int8_tensorwise_per_row — the
+                                canonical producer that byte-matches stock ComfyUI's own
+                                save path. The vision tower, audio tower, and all projectors
+                                stay bfloat16; weights whose in_features is not a multiple of
+                                256 stay bfloat16.
 
 Examples:
   # E4B: HF snapshot -> bf16 base and full-map int8 (one load serves both)
@@ -43,13 +45,15 @@ Source checkpoints (Gemma Terms of Use), pinned to the exact HuggingFace revisio
   google/gemma-4-E4B-it   model.safetensors (bf16) + tokenizer.json + config.json
   google/gemma-4-E2B-it   model.safetensors (bf16) + tokenizer.json + config.json
 
-int8 uses comfy_kitchen QuantizedTensor.from_float (the documented canonical kernel),
-not a hand-rolled quantizer; the language-model / vision+audio-tower split matches the
-established ComfyUI Gemma-4 text-encoder int8 policy.
+int8 quantization is delegated to comfy-quants (comfy_quants.backends.
+int8_tensorwise_model_export._quantize_int8_tensorwise_per_row) — the stock-ComfyUI
+canonical producer — not comfy-kitchen from_float and not a hand-rolled quantizer. The
+language-model / vision+audio-tower split matches the established ComfyUI Gemma-4
+text-encoder int8 policy.
 
 Outputs  ( sha256  file  <-  source, precision ):
   afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab  gemma4_e4b_it_bf16.safetensors  <- google/gemma-4-E4B-it, bf16  (byte-identical to the prior ComfyUI file)
-  d8c30c8e0e5ee5bbb8a8ae6ba17685036f95ed5298647846fd6ba1782bc3f8a6  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8 convrot (canonical from_float; 380 language-model layers incl. both embeddings; vision+audio towers bf16)
+  <int8 sha filled after a verified comfy-quants run>  gemma4_e4b_it_int8_convrot.safetensors  <- gemma4_e4b_it_bf16, int8_tensorwise convrot (comfy-quants canonical; 380 language-model layers incl. both embeddings; vision+audio towers bf16)
 """
 import argparse
 import collections
@@ -61,9 +65,14 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+# Canonical quantization is comfy-quants (Comfy-Org's stock-ComfyUI-aligned offline
+# quantizer). We call its int8_tensorwise producer directly — NOT comfy-kitchen
+# from_float and NOT any hand-rolled path — so the int8 output byte-matches stock
+# ComfyUI's own save path (ops.py:_quantized_weight_state_dict).
+from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
+from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
+
 FP8 = torch.float8_e4m3fn
-INT8_LAYOUT = "TensorWiseINT8Layout"
-INT8_FORMAT = "int8_tensorwise"
 INT8_CONVROT_GROUPSIZE = 256  # power-of-4 Hadamard group; in_features must be a multiple
 
 # HF -> ComfyUI text-encoder key prefixes.
@@ -144,10 +153,9 @@ def load_base(src):
     return out
 
 
-def comfy_quant_tensor(format_name, extra=None):
-    conf = {"format": format_name}
-    if extra:
-        conf.update(extra)
+def marker_tensor(conf):
+    # Encode the comfy_quant marker exactly like stock ComfyUI's save path: default
+    # json.dumps separators + insertion order (comfy-quants' _marker_tensor).
     return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
@@ -163,21 +171,17 @@ def int8_convrot_eligible(k, v):
 
 
 def quantize_int8_weight(k, v):
-    try:
-        from comfy_kitchen.tensor import QuantizedTensor
-    except ImportError as e:
-        raise SystemExit("int8 precision requires comfy-kitchen") from e
     base = k[:-len(".weight")]
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    qt = QuantizedTensor.from_float(
-        v.contiguous().to(dev), INT8_LAYOUT,
-        is_weight=True, per_channel=True,
-        convrot=True, convrot_groupsize=INT8_CONVROT_GROUPSIZE,
-    )
-    tensors = {key: t.detach().to("cpu").contiguous() for key, t in qt.state_dict(f"{base}.weight").items()}
-    tensors[f"{base}.comfy_quant"] = comfy_quant_tensor(
-        INT8_FORMAT, {"convrot": True, "convrot_groupsize": INT8_CONVROT_GROUPSIZE})
-    return tensors
+    qweight, scale, rotated = _quantize_int8_tensorwise_per_row(
+        v.contiguous().to(dev), convrot=True, group_size=INT8_CONVROT_GROUPSIZE)
+    marker = int8_tensorwise_checkpoint_quant_config(
+        convrot=rotated, convrot_groupsize=INT8_CONVROT_GROUPSIZE)
+    return {
+        f"{base}.weight": qweight.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale": scale.detach().to("cpu").contiguous(),
+        f"{base}.comfy_quant": marker_tensor(marker),
+    }
 
 
 def cast(sd, precision):
