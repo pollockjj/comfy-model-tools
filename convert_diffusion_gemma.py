@@ -2,11 +2,11 @@
 """
 Convert DiffusionGemma-26B-A4B checkpoints to ComfyUI text-encoder safetensors.
 
-V2: Kijai's V1 conversion (convert_diffusion_gemma.py, from his ComfyUI diffusion_gemma
-branch), reskinned to the SeedVR2 --src/--job look. One source load serves every --job;
-the source is a Hugging Face snapshot directory (11 shards). Output is BYTE-IDENTICAL to
-Kijai's V1 tool (verified by SHA256); only the CLI/structure changed. Best-practice
-methods live in convert_diffusiongemma_v3.py.
+V3 = V2 + int8 convrot. DiffusionGemma's int8 convrot job is NOT built yet — its 3D MoE
+expert banks have no comfy-quants routine (a separate build) — so V3 currently carries
+only the bf16 and fp8 jobs and is byte-identical to V2 (495d347e / 3d26c504). The bf16 and
+fp8 code below is V2's exact code; when the int8 job lands it is added alongside, leaving
+bf16/fp8 untouched.
 
 Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
 is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
