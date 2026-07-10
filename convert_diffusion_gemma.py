@@ -2,11 +2,16 @@
 """
 Convert DiffusionGemma-26B-A4B checkpoints to ComfyUI text-encoder safetensors.
 
-V3 = V2 + int8 convrot. DiffusionGemma's int8 convrot job is NOT built yet — its 3D MoE
-expert banks have no comfy-quants routine (a separate build) — so V3 currently carries
-only the bf16 and fp8 jobs and is byte-identical to V2 (495d347e / 3d26c504). The bf16 and
-fp8 code below is V2's exact code; when the int8 job lands it is added alongside, leaving
-bf16/fp8 untouched.
+V3 = V2 + int8 convrot. The bf16 and fp8 jobs are V2's exact code, byte-identical to V2
+(495d347e / 3d26c504). The int8 job is full-map decoder int8_tensorwise convrot via the
+comfy-quants stock-ComfyUI producer: 2D decoder weights (embeddings + attention +
+dense-MLP; router and encoder stay bf16) plus the 3D MoE expert banks quantized
+per-expert and restacked ([E, out, in] int8 + [E, out, 1] per-row scales + num_experts
+marker). Groupsize per weight: largest of (256, 64) dividing in_features (gate_up 2816
+-> 256; down 704 -> 64; dense mlp.down 2112 -> 64). Requires ComfyUI
+diffusion-gemma-finish >= 40366067 (int8 convrot bank dequant). int8 convrot is a
+torch.matmul, byte-reproducible only within one fixed environment; the canonical
+surface is interceptor CPU (--device cpu, CUDA_VISIBLE_DEVICES=).
 
 Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
 is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
@@ -42,11 +47,17 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+# int8 convrot is delegated to comfy-quants' stock-ComfyUI producer (byte-matches
+# ComfyUI's own save path), same as convert_gemma4_v3.
+from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
+from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
+
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_INFO = torch.finfo(FP8_DTYPE)
 FP8_MAX = 416.0  # Kijai DiffusionGemma FP8 V1 convention
 EXPERT_HF_SUFFIXES = (".experts.gate_up_proj", ".experts.down_proj")
 EXPERT_WEIGHT_SUFFIXES = (".experts.gate_up_proj.weight", ".experts.down_proj.weight")
+INT8_VALID_GS = (256, 64)  # convrot Hadamard sizes; prefer largest that divides in_features
 
 
 def sha256(path):
@@ -119,7 +130,59 @@ def quantize_2d(k, w):
     }
 
 
-def cast(sd, precision):
+def int8_groupsize(in_features):
+    return next((g for g in INT8_VALID_GS if in_features % g == 0), None)
+
+
+def int8_convrot_eligible_2d(k, v):
+    # Full-map decoder policy (mirrors convert_gemma4_v3): embeddings + attention +
+    # dense-MLP linears; router/control weights and the encoder stay bf16.
+    if not (k.startswith("model.decoder.") and k.endswith(".weight") and v.dim() == 2):
+        return False
+    if "norm" in k or ".router." in k:
+        return False
+    return int8_groupsize(v.shape[1]) is not None
+
+
+def quantize_int8_2d(k, w, dev):
+    base = k[:-len(".weight")]
+    gs = int8_groupsize(w.shape[1])
+    qweight, scale, rotated = _quantize_int8_tensorwise_per_row(
+        w.contiguous().to(dev), convrot=True, group_size=gs)
+    if not rotated:
+        raise SystemExit(f"int8: producer refused convrot rotation for {k} (gs {gs})")
+    marker = int8_tensorwise_checkpoint_quant_config(convrot=True, convrot_groupsize=gs)
+    return {
+        f"{base}.weight": qweight.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale": scale.detach().to("cpu").contiguous(),
+        f"{base}.comfy_quant": marker_tensor(marker),
+    }
+
+
+def quantize_int8_bank(k, w, dev):
+    base = k[:-len(".weight")]
+    num_experts, _, in_features = w.shape
+    gs = int8_groupsize(in_features)
+    if gs is None:
+        raise SystemExit(f"int8: no valid convrot groupsize for bank {k} (in_features {in_features})")
+    qs, ss = [], []
+    for e in range(num_experts):
+        qweight, scale, rotated = _quantize_int8_tensorwise_per_row(
+            w[e].contiguous().to(dev), convrot=True, group_size=gs)
+        if not rotated:
+            raise SystemExit(f"int8: producer refused convrot rotation for {k} expert {e} (gs {gs})")
+        qs.append(qweight.detach().to("cpu"))
+        ss.append(scale.detach().to("cpu"))
+    marker = int8_tensorwise_checkpoint_quant_config(convrot=True, convrot_groupsize=gs)
+    marker["num_experts"] = num_experts
+    return {
+        f"{base}.weight": torch.stack(qs).contiguous(),
+        f"{base}.weight_scale": torch.stack(ss).contiguous(),
+        f"{base}.comfy_quant": marker_tensor(marker),
+    }
+
+
+def cast(sd, precision, device="cpu"):
     out = {}
     nq = 0
     for k, v in sd.items():
@@ -134,10 +197,17 @@ def cast(sd, precision):
                 out.update(quantize_2d(k, v)); nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
+        elif precision == "int8":
+            if is_expert_bank(k):
+                out.update(quantize_int8_bank(k, v, device)); nq += 1
+            elif int8_convrot_eligible_2d(k, v):
+                out.update(quantize_int8_2d(k, v, device)); nq += 1
+            else:
+                out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         else:
             raise SystemExit(f"unknown precision: {precision}")
-    if precision == "fp8":
-        print(f"fp8: quantized {nq} weights")
+    if precision in ("fp8", "int8"):
+        print(f"{precision}: quantized {nq} weights")
     return out
 
 
@@ -146,6 +216,9 @@ def main():
     ap.add_argument("--src", required=True, help="HF snapshot dir or a ComfyUI bf16 safetensors")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
+    ap.add_argument("--device", default="cpu",
+                    help="int8 convrot device; cpu is the canonical byte-reproducible target "
+                         "(interceptor CPU). bf16/fp8 jobs are matmul-free and ignore this.")
     args = ap.parse_args()
 
     base = load_base(args.src)
@@ -158,7 +231,7 @@ def main():
         head, sha_sep, tail = remainder.rpartition(":")
         if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
             out, expected = head, tail.lower()
-        tensors = cast(base, precision)
+        tensors = cast(base, precision, device=args.device)
         save_file(tensors, out)
         digest = sha256(out)
         verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
