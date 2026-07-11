@@ -20,6 +20,11 @@ CPU MXFP8 producer. Each weight stores FP8-E4M3 values plus per-32-element UE8M0
 scales in CUTLASS/cublas 128x4 blocked layout. The expert banks use the strict
 mxfp8_cutlass_fused_moe_v1 marker; activation microscaling is dynamic at runtime.
 
+The mxfp8_fused_qkv job additionally replaces each decoder attention block's
+separate Q/K/V (or global Q/K) MXFP8 tensors with one qkv_proj tensor. The
+mxfp8_qkv_patch job performs only that payload-preserving structural rewrite on
+an existing all-linears MXFP8 safetensors file; it does not requantize any value.
+
 Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
 is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
 tokenizer.json. lm_head.* is dropped.
@@ -34,6 +39,8 @@ Precisions:
   mxfp8_fused                   natural fused gate_up + down 3D expert banks -> float8_e4m3fn
                                 and decoder-layer matrices -> float8_e4m3fn with per-32-element
                                 UE8M0 scales in CUTLASS 128x4 layout.
+  mxfp8_fused_qkv               mxfp8_fused with one concatenated attention projection per block.
+  mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
 
 Examples:
   python convert_diffusiongemma_v2.py \
@@ -78,6 +85,12 @@ MXFP8_FUSED_BANK_SHAPES = {
     ".experts.gate_up_proj.weight": ((128, 1408, 2816), (128, 1408, 88)),
     ".experts.down_proj.weight": ((128, 2816, 704), (128, 2816, 24)),
 }
+MXFP8_QKV_CONTRACT = "diffusiongemma_mxfp8_qkv_fused.v1"
+MXFP8_QKV_HIDDEN_SIZE = 2816
+MXFP8_QKV_SCALE_COLS = 88
+MXFP8_QKV_LAYER_COUNT = 30
+MXFP8_SLIDING_PROJECTIONS = (("q_proj", 4096), ("k_proj", 2048), ("v_proj", 2048))
+MXFP8_GLOBAL_PROJECTIONS = (("q_proj", 8192), ("k_proj", 1024))
 
 
 def sha256(path):
@@ -230,6 +243,84 @@ def quantize_mxfp8_2d(k, w):
     }
 
 
+def fuse_mxfp8_attention_projections(sd):
+    """Replace DG's separate MXFP8 attention projections without requantization."""
+    for layer in range(MXFP8_QKV_LAYER_COUNT):
+        projections = (
+            MXFP8_GLOBAL_PROJECTIONS if layer % 6 == 5 else MXFP8_SLIDING_PROJECTIONS
+        )
+        attention = f"model.decoder.layers.{layer}.self_attn"
+        fused = f"{attention}.qkv_proj"
+        fused_keys = tuple(f"{fused}.{suffix}" for suffix in ("weight", "weight_scale", "comfy_quant"))
+        collisions = [key for key in fused_keys if key in sd]
+        if collisions:
+            raise SystemExit(f"mxfp8 qkv: output keys already exist: {collisions}")
+
+        weights = []
+        scales = []
+        component_keys = []
+        for projection, out_features in projections:
+            base = f"{attention}.{projection}"
+            weight_key = f"{base}.weight"
+            scale_key = f"{base}.weight_scale"
+            marker_key = f"{base}.comfy_quant"
+            missing = [key for key in (weight_key, scale_key, marker_key) if key not in sd]
+            if missing:
+                raise SystemExit(f"mxfp8 qkv: missing layer {layer} payload: {missing}")
+
+            weight = sd[weight_key]
+            scale = sd[scale_key]
+            marker = sd[marker_key]
+            expected_weight = (out_features, MXFP8_QKV_HIDDEN_SIZE)
+            expected_scale = (out_features, MXFP8_QKV_SCALE_COLS)
+            if (
+                weight.device.type != "cpu"
+                or weight.dtype != torch.float8_e4m3fn
+                or tuple(weight.shape) != expected_weight
+                or not weight.is_contiguous()
+            ):
+                raise SystemExit(
+                    f"mxfp8 qkv: {weight_key} expected contiguous CPU E4M3 {expected_weight}, "
+                    f"got {weight.device} {weight.dtype} {tuple(weight.shape)}"
+                )
+            if (
+                scale.device.type != "cpu"
+                or scale.dtype != torch.uint8
+                or tuple(scale.shape) != expected_scale
+                or not scale.is_contiguous()
+            ):
+                raise SystemExit(
+                    f"mxfp8 qkv: {scale_key} expected contiguous CPU uint8 {expected_scale}, "
+                    f"got {scale.device} {scale.dtype} {tuple(scale.shape)}"
+                )
+            if marker.device.type != "cpu" or marker.dtype != torch.uint8 or marker.ndim != 1:
+                raise SystemExit(f"mxfp8 qkv: invalid marker tensor {marker_key}")
+            try:
+                conf = json.loads(marker.numpy().tobytes())
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SystemExit(f"mxfp8 qkv: invalid marker JSON {marker_key}: {error}") from error
+            if conf.get("format") != "mxfp8" or conf.get("full_precision_matrix_mult") is not False:
+                raise SystemExit(f"mxfp8 qkv: incompatible marker {marker_key}: {conf}")
+
+            weights.append(weight)
+            scales.append(scale)
+            component_keys.extend((weight_key, scale_key, marker_key))
+
+        sd[fused_keys[0]] = torch.cat(weights, dim=0).contiguous()
+        sd[fused_keys[1]] = torch.cat(scales, dim=0).contiguous()
+        sd[fused_keys[2]] = marker_tensor({
+            "format": "mxfp8",
+            "full_precision_matrix_mult": False,
+            "artifact_contract": MXFP8_QKV_CONTRACT,
+            "projection_order": [projection for projection, _ in projections],
+            "projection_splits": [out_features for _, out_features in projections],
+        })
+        for key in component_keys:
+            del sd[key]
+
+    return MXFP8_QKV_LAYER_COUNT
+
+
 def int8_groupsize(in_features):
     return next((g for g in INT8_VALID_GS if in_features % g == 0), None)
 
@@ -283,6 +374,12 @@ def quantize_int8_bank(k, w, dev):
 
 
 def cast(sd, precision, device="cpu"):
+    if precision == "mxfp8_qkv_patch":
+        out = dict(sd)
+        fused = fuse_mxfp8_attention_projections(out)
+        print(f"{precision}: fused {fused} attention projection groups without requantization")
+        return out
+
     out = {}
     nq = 0
     for k, v in sd.items():
@@ -299,7 +396,7 @@ def cast(sd, precision, device="cpu"):
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
-        elif precision == "mxfp8_fused":
+        elif precision in ("mxfp8_fused", "mxfp8_fused_qkv"):
             if is_expert_bank(k):
                 out.update(quantize_mxfp8_fused_bank(k, v))
                 nq += 1
@@ -319,7 +416,10 @@ def cast(sd, precision, device="cpu"):
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         else:
             raise SystemExit(f"unknown precision: {precision}")
-    if precision in ("fp8", "mxfp8_fused", "int8"):
+    if precision == "mxfp8_fused_qkv":
+        fused = fuse_mxfp8_attention_projections(out)
+        print(f"{precision}: fused {fused} attention projection groups")
+    if precision in ("fp8", "mxfp8_fused", "mxfp8_fused_qkv", "int8"):
         print(f"{precision}: quantized {nq} weights")
     return out
 
@@ -331,8 +431,8 @@ def main():
                     help="repeatable; one source load serves every job")
     ap.add_argument("--device", default="cpu",
                     help="int8 convrot device; cpu is the canonical byte-reproducible target "
-                         "(interceptor CPU). bf16/fp8/mxfp8_fused jobs ignore this; "
-                         "mxfp8_fused always uses the deterministic CPU producer.")
+                         "(interceptor CPU). bf16/fp8/MXFP8 jobs ignore this; "
+                         "MXFP8 conversion always uses the deterministic CPU producer.")
     args = ap.parse_args()
 
     base = load_base(args.src)
