@@ -25,9 +25,9 @@ separate Q/K/V (or global Q/K) MXFP8 tensors with one qkv_proj tensor. The
 mxfp8_qkv_patch job performs only that payload-preserving structural rewrite on
 an existing all-linears MXFP8 safetensors file; it does not requantize any value.
 
-Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
-is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
-tokenizer.json. lm_head.* is dropped.
+Base jobs keep HF naming (model.decoder.*, model.encoder.*), rename the fused expert
+banks to <bank>.weight (comfy.ops.MoEExperts), and embed tokenizer.json. QKV jobs also
+replace attention projection component keys with qkv_proj. lm_head.* is dropped.
 
 Precisions:
   bf16                          every float tensor -> bfloat16; expert banks -> <bank>.weight.
@@ -255,6 +255,16 @@ def fuse_mxfp8_attention_projections(sd):
         collisions = [key for key in fused_keys if key in sd]
         if collisions:
             raise SystemExit(f"mxfp8 qkv: output keys already exist: {collisions}")
+        projection_names = {projection for projection, _ in projections}
+        unexpected = [
+            f"{attention}.{projection}.{suffix}"
+            for projection in ("q_proj", "k_proj", "v_proj")
+            if projection not in projection_names
+            for suffix in ("weight", "weight_scale", "comfy_quant")
+            if f"{attention}.{projection}.{suffix}" in sd
+        ]
+        if unexpected:
+            raise SystemExit(f"mxfp8 qkv: unexpected layer {layer} payload: {unexpected}")
 
         weights = []
         scales = []
