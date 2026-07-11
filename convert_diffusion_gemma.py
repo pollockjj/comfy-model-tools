@@ -15,10 +15,11 @@ environment; the canonical surface is interceptor CPU (--device cpu,
 CUDA_VISIBLE_DEVICES=).
 
 The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
-the 60 MoE banks plus 205 decoder-layer matrices with comfy-quants' deterministic
-CPU MXFP8 producer. Each weight stores FP8-E4M3 values plus per-32-element UE8M0
-scales in CUTLASS/cublas 128x4 blocked layout. The expert banks use the strict
-mxfp8_cutlass_fused_moe_v1 marker; activation microscaling is dynamic at runtime.
+the 60 MoE banks, 205 decoder-layer matrices, and the tied decoder token embedding
+with comfy-quants' deterministic CPU MXFP8 producer. Each weight stores FP8-E4M3
+values plus per-32-element UE8M0 scales in CUTLASS/cublas 128x4 blocked layout. The
+expert banks use the strict mxfp8_cutlass_fused_moe_v1 marker; activation
+microscaling is dynamic at runtime.
 
 Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
 is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
@@ -74,6 +75,8 @@ INT8_VALID_GS = (256, 64)  # convrot Hadamard sizes; prefer largest that divides
 MXFP8_FUSED_FORMAT = "mxfp8_cutlass_fused_moe_v1"
 MXFP8_FUSED_CONTRACT = "diffusiongemma_mxfp8_cutlass_fused_moe.v1"
 MXFP8_NUM_EXPERTS = 128
+MXFP8_TIED_EMBEDDING_KEY = "model.decoder.embed_tokens.weight"
+MXFP8_TIED_EMBEDDING_SHAPE = (262144, 2816)
 MXFP8_FUSED_BANK_SHAPES = {
     ".experts.gate_up_proj.weight": ((128, 1408, 2816), (128, 1408, 88)),
     ".experts.down_proj.weight": ((128, 2816, 704), (128, 2816, 24)),
@@ -207,6 +210,13 @@ def quantize_mxfp8_fused_bank(k, w):
 
 
 def mxfp8_eligible_2d(k, v):
+    if k == MXFP8_TIED_EMBEDDING_KEY:
+        if tuple(v.shape) != MXFP8_TIED_EMBEDDING_SHAPE:
+            raise SystemExit(
+                f"mxfp8_fused: {k} expected shape {MXFP8_TIED_EMBEDDING_SHAPE}, "
+                f"got {tuple(v.shape)}"
+            )
+        return True
     return (
         k.startswith("model.decoder.layers.")
         and k.endswith(".weight")
