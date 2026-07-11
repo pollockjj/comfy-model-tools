@@ -15,11 +15,10 @@ environment; the canonical surface is interceptor CPU (--device cpu,
 CUDA_VISIBLE_DEVICES=).
 
 The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
-only the 60 MoE banks with comfy-quants' deterministic CPU MXFP8 producer. Each bank
-stores FP8-E4M3 weights plus per-32-element UE8M0 scales in CUTLASS/cublas 128x4
-blocked layout. Non-expert tensors stay BF16. The artifact is consumed through the
-strict mxfp8_cutlass_fused_moe_v1 marker; activation microscaling is dynamic at
-runtime.
+the 60 MoE banks plus 205 decoder-layer matrices with comfy-quants' deterministic
+CPU MXFP8 producer. Each weight stores FP8-E4M3 values plus per-32-element UE8M0
+scales in CUTLASS/cublas 128x4 blocked layout. The expert banks use the strict
+mxfp8_cutlass_fused_moe_v1 marker; activation microscaling is dynamic at runtime.
 
 Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
 is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
@@ -33,8 +32,8 @@ Precisions:
                                 non-norm) -> float8_e4m3fn per-tensor scale (amax / 416).
                                 Everything else -> bfloat16.
   mxfp8_fused                   natural fused gate_up + down 3D expert banks -> float8_e4m3fn
-                                with per-32-element UE8M0 scales in CUTLASS 128x4 layout.
-                                Everything else -> bfloat16.
+                                and decoder-layer matrices -> float8_e4m3fn with per-32-element
+                                UE8M0 scales in CUTLASS 128x4 layout.
 
 Examples:
   python convert_diffusiongemma_v2.py \
@@ -207,6 +206,30 @@ def quantize_mxfp8_fused_bank(k, w):
     }
 
 
+def mxfp8_eligible_2d(k, v):
+    return (
+        k.startswith("model.decoder.layers.")
+        and k.endswith(".weight")
+        and v.dim() == 2
+        and "norm" not in k
+        and ".router." not in k
+    )
+
+
+def quantize_mxfp8_2d(k, w):
+    if w.device.type != "cpu":
+        raise SystemExit(f"mxfp8_fused: canonical conversion requires CPU source tensors ({k})")
+    qweight, weight_scale = quantize_mxfp8_block(w.contiguous())
+    base = k[:-len(".weight")]
+    return {
+        f"{base}.weight": qweight.contiguous(),
+        f"{base}.weight_scale": weight_scale.contiguous(),
+        f"{base}.comfy_quant": marker_tensor(
+            {"format": "mxfp8", "full_precision_matrix_mult": False}
+        ),
+    }
+
+
 def int8_groupsize(in_features):
     return next((g for g in INT8_VALID_GS if in_features % g == 0), None)
 
@@ -277,6 +300,9 @@ def cast(sd, precision, device="cpu"):
         elif precision == "mxfp8_fused":
             if is_expert_bank(k):
                 out.update(quantize_mxfp8_fused_bank(k, v))
+                nq += 1
+            elif mxfp8_eligible_2d(k, v):
+                out.update(quantize_mxfp8_2d(k, v))
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
