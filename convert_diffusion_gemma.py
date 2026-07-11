@@ -292,9 +292,11 @@ def cast(sd, precision, device="cpu"):
             out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         elif precision == "fp8":
             if is_expert_bank(k):
-                out.update(quantize_bank(k, v)); nq += 1
+                out.update(quantize_bank(k, v))
+                nq += 1
             elif should_quantize_2d(k, v):
-                out.update(quantize_2d(k, v)); nq += 1
+                out.update(quantize_2d(k, v))
+                nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         elif precision == "mxfp8_fused":
@@ -308,9 +310,11 @@ def cast(sd, precision, device="cpu"):
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         elif precision == "int8":
             if is_expert_bank(k):
-                out.update(quantize_int8_bank(k, v, device)); nq += 1
+                out.update(quantize_int8_bank(k, v, device))
+                nq += 1
             elif int8_convrot_eligible_2d(k, v):
-                out.update(quantize_int8_2d(k, v, device)); nq += 1
+                out.update(quantize_int8_2d(k, v, device))
+                nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         else:
