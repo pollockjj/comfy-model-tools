@@ -2,16 +2,24 @@
 """
 Convert DiffusionGemma-26B-A4B checkpoints to ComfyUI text-encoder safetensors.
 
-V3 = V2 + int8 convrot. The bf16 and fp8 jobs are V2's exact code, byte-identical to V2
-(495d347e / 3d26c504). The int8 job is full-map decoder int8_tensorwise convrot via the
-comfy-quants stock-ComfyUI producer: 2D decoder weights (embeddings + attention +
-dense-MLP; router and encoder stay bf16) plus the 3D MoE expert banks quantized
-per-expert and restacked ([E, out, in] int8 + [E, out, 1] per-row scales + num_experts
-marker). Groupsize per weight: largest of (256, 64) dividing in_features (gate_up 2816
--> 256; down 704 -> 64; dense mlp.down 2112 -> 64). Requires ComfyUI
-diffusion-gemma-finish >= 40366067 (int8 convrot bank dequant). int8 convrot is a
-torch.matmul, byte-reproducible only within one fixed environment; the canonical
-surface is interceptor CPU (--device cpu, CUDA_VISIBLE_DEVICES=).
+V3 = V2 + int8 convrot + fused MXFP8 experts. The bf16 and fp8 jobs are V2's exact
+code, byte-identical to V2 (495d347e / 3d26c504). The int8 job is full-map decoder
+int8_tensorwise convrot via the comfy-quants stock-ComfyUI producer: 2D decoder
+weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus the
+3D MoE expert banks quantized per-expert and restacked ([E, out, in] int8 +
+[E, out, 1] per-row scales + num_experts marker). Groupsize per weight: largest of
+(256, 64) dividing in_features (gate_up 2816 -> 256; down 704 -> 64; dense mlp.down
+2112 -> 64). Requires ComfyUI diffusion-gemma-finish >= 40366067 (int8 convrot bank
+dequant). int8 convrot is a torch.matmul, byte-reproducible only within one fixed
+environment; the canonical surface is interceptor CPU (--device cpu,
+CUDA_VISIBLE_DEVICES=).
+
+The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
+only the 60 MoE banks with comfy-quants' deterministic CPU MXFP8 producer. Each bank
+stores FP8-E4M3 weights plus per-32-element UE8M0 scales in CUTLASS/cublas 128x4
+blocked layout. Non-expert tensors stay BF16. The artifact is consumed through the
+strict mxfp8_cutlass_fused_moe_v1 marker; activation microscaling is dynamic at
+runtime.
 
 Keys are kept in HF naming (model.decoder.*, model.encoder.*); the only structural change
 is renaming the fused expert banks to <bank>.weight (comfy.ops.MoEExperts) and embedding
@@ -24,12 +32,16 @@ Precisions:
                                 text-backbone weights (model.decoder.layers.*, max(shape) >= 4096,
                                 non-norm) -> float8_e4m3fn per-tensor scale (amax / 416).
                                 Everything else -> bfloat16.
+  mxfp8_fused                   natural fused gate_up + down 3D expert banks -> float8_e4m3fn
+                                with per-32-element UE8M0 scales in CUTLASS 128x4 layout.
+                                Everything else -> bfloat16.
 
 Examples:
   python convert_diffusiongemma_v2.py \
       --src ~/.cache/huggingface/hub/models--google--diffusiongemma-26B-A4B-it/snapshots/<rev> \
       --job bf16:diffusiongemma_comfy_bf16.safetensors:495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1 \
-      --job fp8:diffusiongemma_comfy_fp8.safetensors:3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015
+      --job fp8:diffusiongemma_comfy_fp8.safetensors:3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015 \
+      --job mxfp8_fused:diffusiongemma_comfy_mxfp8_cutlass_fused_moe_v1.safetensors
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
 
@@ -51,6 +63,8 @@ from safetensors.torch import save_file
 # ComfyUI's own save path), same as convert_gemma4_v3.
 from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
 from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
+from comfy_quants.formats.mxfp8_blocked import BLOCK_SIZE as MXFP8_BLOCK
+from comfy_quants.formats.mxfp8_blocked import quantize_mxfp8_block
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_INFO = torch.finfo(FP8_DTYPE)
@@ -58,6 +72,13 @@ FP8_MAX = 416.0  # Kijai DiffusionGemma FP8 V1 convention
 EXPERT_HF_SUFFIXES = (".experts.gate_up_proj", ".experts.down_proj")
 EXPERT_WEIGHT_SUFFIXES = (".experts.gate_up_proj.weight", ".experts.down_proj.weight")
 INT8_VALID_GS = (256, 64)  # convrot Hadamard sizes; prefer largest that divides in_features
+MXFP8_FUSED_FORMAT = "mxfp8_cutlass_fused_moe_v1"
+MXFP8_FUSED_CONTRACT = "diffusiongemma_mxfp8_cutlass_fused_moe.v1"
+MXFP8_NUM_EXPERTS = 128
+MXFP8_FUSED_BANK_SHAPES = {
+    ".experts.gate_up_proj.weight": ((128, 1408, 2816), (128, 1408, 88)),
+    ".experts.down_proj.weight": ((128, 2816, 704), (128, 2816, 24)),
+}
 
 
 def sha256(path):
@@ -130,6 +151,62 @@ def quantize_2d(k, w):
     }
 
 
+def mxfp8_fused_conf():
+    return {
+        "format": MXFP8_FUSED_FORMAT,
+        "artifact_contract": MXFP8_FUSED_CONTRACT,
+        "num_experts": MXFP8_NUM_EXPERTS,
+        "group_size": MXFP8_BLOCK,
+        "weight_dtype": "float8_e4m3fn",
+        "block_scale_dtype": "ue8m0",
+        "block_scale_layout": "cutlass_128x4",
+        "projection_order": "gate_up",
+        "activation_scale": "dynamic_e8m0_1x32",
+        "full_precision_matrix_mult": False,
+    }
+
+
+def quantize_mxfp8_fused_bank(k, w):
+    expected = next(
+        (shapes for suffix, shapes in MXFP8_FUSED_BANK_SHAPES.items() if k.endswith(suffix)),
+        None,
+    )
+    if expected is None:
+        raise SystemExit(f"mxfp8_fused: unsupported expert bank {k}")
+    expected_weight_shape, expected_scale_shape = expected
+    if tuple(w.shape) != expected_weight_shape:
+        raise SystemExit(
+            f"mxfp8_fused: {k} expected shape {expected_weight_shape}, got {tuple(w.shape)}"
+        )
+    if w.device.type != "cpu":
+        raise SystemExit(f"mxfp8_fused: canonical conversion requires CPU source tensors ({k})")
+
+    qweights = []
+    weight_scales = []
+    for expert in range(MXFP8_NUM_EXPERTS):
+        qweight, weight_scale = quantize_mxfp8_block(w[expert].contiguous())
+        qweights.append(qweight)
+        weight_scales.append(weight_scale)
+
+    qweight = torch.stack(qweights).contiguous()
+    weight_scale = torch.stack(weight_scales).contiguous()
+    if qweight.dtype != torch.float8_e4m3fn or tuple(qweight.shape) != expected_weight_shape:
+        raise SystemExit(
+            f"mxfp8_fused: {k} produced invalid qweight {qweight.dtype} {tuple(qweight.shape)}"
+        )
+    if weight_scale.dtype != torch.uint8 or tuple(weight_scale.shape) != expected_scale_shape:
+        raise SystemExit(
+            f"mxfp8_fused: {k} produced invalid scale {weight_scale.dtype} {tuple(weight_scale.shape)}"
+        )
+
+    base = k[:-len(".weight")]
+    return {
+        f"{base}.weight": qweight,
+        f"{base}.weight_scale": weight_scale,
+        f"{base}.comfy_quant": marker_tensor(mxfp8_fused_conf()),
+    }
+
+
 def int8_groupsize(in_features):
     return next((g for g in INT8_VALID_GS if in_features % g == 0), None)
 
@@ -197,6 +274,11 @@ def cast(sd, precision, device="cpu"):
                 out.update(quantize_2d(k, v)); nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
+        elif precision == "mxfp8_fused":
+            if is_expert_bank(k):
+                out.update(quantize_mxfp8_fused_bank(k, v)); nq += 1
+            else:
+                out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         elif precision == "int8":
             if is_expert_bank(k):
                 out.update(quantize_int8_bank(k, v, device)); nq += 1
@@ -206,7 +288,7 @@ def cast(sd, precision, device="cpu"):
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         else:
             raise SystemExit(f"unknown precision: {precision}")
-    if precision in ("fp8", "int8"):
+    if precision in ("fp8", "mxfp8_fused", "int8"):
         print(f"{precision}: quantized {nq} weights")
     return out
 
@@ -218,7 +300,8 @@ def main():
                     help="repeatable; one source load serves every job")
     ap.add_argument("--device", default="cpu",
                     help="int8 convrot device; cpu is the canonical byte-reproducible target "
-                         "(interceptor CPU). bf16/fp8 jobs are matmul-free and ignore this.")
+                         "(interceptor CPU). bf16/fp8/mxfp8_fused jobs ignore this; "
+                         "mxfp8_fused always uses the deterministic CPU producer.")
     args = ap.parse_args()
 
     base = load_base(args.src)
