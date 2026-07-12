@@ -51,11 +51,49 @@ TOP_MAP = {
 }
 
 
+SAFETENSORS_TOP_MAP = {
+    "pre_projection.weight": "mtp.pre_projection.weight",
+    "post_projection.weight": "mtp.post_projection.weight",
+    "model.norm.weight": "mtp.norm.weight",
+    "model.embed_tokens.weight": "mtp.embed_tokens.weight",
+}
+# centroid masked-embedding tensors are not used by the ComfyUI drafter (logits are
+# tied to the assistant embedding table)
+SAFETENSORS_SKIP = {"masked_embedding.centroids.weight", "masked_embedding.token_ordering"}
+
+
+def convert_safetensors(src, dst):
+    from safetensors import safe_open
+    out = {}
+    with safe_open(src, framework="pt") as f:
+        for name in f.keys():
+            if name in SAFETENSORS_SKIP:
+                continue
+            w = f.get_tensor(name).to(torch.bfloat16)
+            m = re.match(r"model\.layers\.(\d+)\.(.+)", name)
+            if m:
+                key = f"mtp.layers.{m.group(1)}.{m.group(2)}"
+            elif name in SAFETENSORS_TOP_MAP:
+                key = SAFETENSORS_TOP_MAP[name]
+            else:
+                raise SystemExit(f"unmapped tensor: {name}")
+            out[key] = w.contiguous()
+    save_file(out, dst)
+    print(f"mtp: wrote {len(out)} tensors -> {dst}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", required=True)
+    ap.add_argument("--gguf")
+    ap.add_argument("--safetensors", help="official HF assistant model.safetensors (bf16, preferred provenance)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+
+    if args.safetensors:
+        convert_safetensors(args.safetensors, args.out)
+        return
+    if not args.gguf:
+        raise SystemExit("one of --gguf / --safetensors is required")
 
     r = GGUFReader(args.gguf)
     out = {}
