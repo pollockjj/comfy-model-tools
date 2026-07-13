@@ -176,12 +176,14 @@ def cast(sd, precision, device="cpu"):
             out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
         elif precision == "fp8_scaled":
             if should_quantize_fp8_scaled(k, v):
-                out.update(quantize_fp8_scaled_weight(k, v)); nq += 1
+                out.update(quantize_fp8_scaled_weight(k, v))
+                nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
         elif precision == "int8":
             if int8_convrot_eligible(k, v):
-                out.update(quantize_int8_weight(k, v, device)); nq += 1
+                out.update(quantize_int8_weight(k, v, device))
+                nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
         else:
