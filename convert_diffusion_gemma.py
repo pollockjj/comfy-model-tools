@@ -9,8 +9,8 @@ weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus 
 3D MoE expert banks quantized per-expert and restacked ([E, out, in] int8 +
 [E, out, 1] per-row scales + num_experts marker). Groupsize per weight: largest of
 (256, 64) dividing in_features (gate_up 2816 -> 256; down 704 -> 64; dense mlp.down
-2112 -> 64). Requires ComfyUI diffusion-gemma-finish >= 40366067 (int8 convrot bank
-dequant). int8 convrot is a torch.matmul, byte-reproducible only within one fixed
+2112 -> 64). Requires ComfyUI `diffusion-gemma-finish-dg` containing `a362a5e5`
+(packed INT8 ConvRot expert execution). int8 convrot is a torch.matmul, byte-reproducible only within one fixed
 environment; the canonical surface is interceptor CPU (--device cpu,
 CUDA_VISIBLE_DEVICES=).
 
@@ -44,7 +44,7 @@ Precisions:
   mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
 
 Examples:
-  python convert_diffusiongemma_v2.py \
+  python convert_diffusion_gemma.py \
       --src ~/.cache/huggingface/hub/models--google--diffusiongemma-26B-A4B-it/snapshots/<rev> \
       --job bf16:diffusiongemma_comfy_bf16.safetensors:495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1 \
       --job fp8:diffusiongemma_comfy_fp8.safetensors:3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015 \
@@ -67,7 +67,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 # int8 convrot is delegated to comfy-quants' stock-ComfyUI producer (byte-matches
-# ComfyUI's own save path), same as convert_gemma4_v3.
+# ComfyUI's own save path), same as convert_gemma4.py.
 from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
 from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
 from comfy_quants.formats.mxfp8_blocked import BLOCK_SIZE as MXFP8_BLOCK
@@ -346,7 +346,7 @@ def int8_groupsize(in_features):
 
 
 def int8_convrot_eligible_2d(k, v):
-    # Full-map decoder policy (mirrors convert_gemma4_v3): embeddings + attention +
+    # Full-map decoder policy (mirrors convert_gemma4.py): embeddings + attention +
     # dense-MLP linears; router/control weights and the encoder stay bf16.
     if not (k.startswith("model.decoder.") and k.endswith(".weight") and v.dim() == 2):
         return False

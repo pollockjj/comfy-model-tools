@@ -24,11 +24,11 @@ Precisions:
                                 (--device cpu, CUDA_VISIBLE_DEVICES=).
 
 Examples:
-  python convert_gemma4_v3.py --src <hf_dir_or_comfy_bf16> \
+  python convert_gemma4.py --src <hf_dir_or_comfy_bf16> \
       --job bf16:gemma4_e4b_it_bf16.safetensors:afe21e7c99d5a2ba52bc246a464d2458726204c3ce98ee81398204786ecab5ab \
       --job fp8_scaled:gemma4_e4b_it_fp8_scaled.safetensors:bf0b4fa2e41a25684dc9e9b256cd505564f02fed09be3da95ce024e653e2c52b
 
-  CUDA_VISIBLE_DEVICES= python convert_gemma4_v3.py --device cpu --src gemma4_e4b_it_bf16.safetensors \
+  CUDA_VISIBLE_DEVICES= python convert_gemma4.py --device cpu --src gemma4_e4b_it_bf16.safetensors \
       --job int8:gemma4_e4b_it_int8_convrot.safetensors:065ea4422aa107c7133e9cf530582d6ba65057d089e35824e1d06da20960818c
 
 A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file. bf16

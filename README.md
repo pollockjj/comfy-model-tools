@@ -39,6 +39,28 @@ COMFYUI_ROOT=/path/to/ComfyUI CUDA_VISIBLE_DEVICES=0 python \
 See [DIFFUSIONGEMMA_NVFP4_REV0.md](DIFFUSIONGEMMA_NVFP4_REV0.md) for converter and
 artifact hashes, tensor coverage, the measured RTX 5090 smoke result, and known limits.
 
+## Convert Gemma 4 E2B / E4B
+
+`convert_gemma4.py` converts either Gemma 4 variant from a Hugging Face snapshot or
+an existing ComfyUI BF16 text encoder. One source load can write deterministic BF16,
+Kijai-compatible scaled FP8, and INT8 ConvRot jobs. The INT8 policy covers eligible
+language-model matrices while leaving vision, audio, and projector tensors in BF16.
+
+```sh
+python convert_gemma4.py --src /path/to/gemma-4-E4B-it \
+    --job bf16:/path/to/gemma4_e4b_it_bf16.safetensors \
+    --job fp8_scaled:/path/to/gemma4_e4b_it_fp8_scaled.safetensors
+
+CUDA_VISIBLE_DEVICES= python convert_gemma4.py --device cpu \
+    --src /path/to/gemma4_e4b_it_bf16.safetensors \
+    --job int8:/path/to/gemma4_e4b_it_int8_convrot.safetensors
+```
+
+The same commands accept E2B sources. Gemma 4 NVFP4 and MXFP8 artifact contracts
+remain open work; generic block-format writers are not substitutes for a validated
+model-specific conversion policy. `convert_gemma4_mtp.py` separately extracts the
+E2B/E4B MTP drafter sidecar from an official assistant safetensors or llama.cpp GGUF.
+
 ## Merge Safetensors
 
 `merge_safetensors.py`: Merge all safetensors files in a directory into a single safetensors file. If duplicate keys exist, they are skipped with a warning:
