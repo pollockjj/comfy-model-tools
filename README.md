@@ -2,6 +2,21 @@
 
 Utility scripts for packaging models for ComfyUI.
 
+## DiffusionGemma NVFP4 rev-0
+
+`convert_diffusion_gemma_block_formats.py` converts an existing ComfyUI BF16
+DiffusionGemma text encoder to MXFP8 or NVFP4 through ComfyUI's comfy-kitchen-backed
+tensor-core layouts. The NVFP4 path is the frozen rev-0 storage baseline: it creates
+a runnable model, but it contains no DiffusionGemma-specific throughput optimization.
+
+```sh
+COMFYUI_ROOT=/path/to/ComfyUI CUDA_VISIBLE_DEVICES=0 python \
+    convert_diffusion_gemma_block_formats.py --format nvfp4
+```
+
+See [DIFFUSIONGEMMA_NVFP4_REV0.md](DIFFUSIONGEMMA_NVFP4_REV0.md) for converter and
+artifact hashes, tensor coverage, the measured RTX 5090 smoke result, and known limits.
+
 ## Merge Safetensors
 
 `merge_safetensors.py`: Merge all safetensors files in a directory into a single safetensors file. If duplicate keys exist, they are skipped with a warning:
