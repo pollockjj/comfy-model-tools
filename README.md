@@ -2,16 +2,38 @@
 
 Utility scripts for packaging models for ComfyUI.
 
-## DiffusionGemma NVFP4 rev-0
+## Convert DiffusionGemma
+
+`convert_diffusion_gemma.py` converts a DiffusionGemma HF snapshot or ComfyUI BF16
+text encoder with repeatable `--job` arguments. It supports `bf16`, `fp8`, full-map
+`int8` ConvRot, fused-bank `mxfp8_fused`, fused-bank plus fused-attention
+`mxfp8_fused_qkv`, and the payload-preserving `mxfp8_qkv_patch`. The MXFP8 jobs
+quantize the tied decoder token embedding as well as decoder matrices and expert
+banks.
+
+```sh
+python convert_diffusion_gemma.py --src /path/to/source \
+    --job bf16:/path/to/diffusiongemma_bf16.safetensors \
+    --job fp8:/path/to/diffusiongemma_fp8.safetensors \
+    --job int8:/path/to/diffusiongemma_int8_convrot.safetensors \
+    --job mxfp8_fused_qkv:/path/to/diffusiongemma_mxfp8.safetensors
+```
+
+## Convert DiffusionGemma NVFP4
 
 `convert_diffusion_gemma_block_formats.py` converts an existing ComfyUI BF16
 DiffusionGemma text encoder to MXFP8 or NVFP4 through ComfyUI's comfy-kitchen-backed
-tensor-core layouts. The NVFP4 path is the frozen rev-0 storage baseline: it creates
-a runnable model, but it contains no DiffusionGemma-specific throughput optimization.
+tensor-core layouts. The `nvfp4_fused` job transcodes NVIDIA's calibrated NVFP4
+expert payload without requantization. The legacy `nvfp4` job preserves the frozen
+rev-0 storage baseline: it creates a runnable model, but contains no
+DiffusionGemma-specific throughput optimization.
 
 ```sh
 COMFYUI_ROOT=/path/to/ComfyUI CUDA_VISIBLE_DEVICES=0 python \
-    convert_diffusion_gemma_block_formats.py --format nvfp4
+    convert_diffusion_gemma_block_formats.py \
+    --src /path/to/diffusiongemma_bf16.safetensors \
+    --nvidia-model-dir /path/to/nvidia/diffusiongemma_nvfp4 \
+    --format nvfp4_fused
 ```
 
 See [DIFFUSIONGEMMA_NVFP4_REV0.md](DIFFUSIONGEMMA_NVFP4_REV0.md) for converter and
