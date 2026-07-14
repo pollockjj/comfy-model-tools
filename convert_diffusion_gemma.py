@@ -2,7 +2,7 @@
 """
 Convert DiffusionGemma-26B-A4B checkpoints to ComfyUI text-encoder safetensors.
 
-V3 = V2 + int8 convrot + fused MXFP8 experts. The bf16 and fp8 jobs are V2's exact
+V3 = V2 + int8/int4 convrot + fused MXFP8 experts. The bf16 and fp8 jobs are V2's exact
 code, byte-identical to V2 (495d347e / 3d26c504). The int8 job is full-map decoder
 int8_tensorwise convrot via the comfy-quants stock-ComfyUI producer: 2D decoder
 weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus the
@@ -13,6 +13,11 @@ weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus 
 (packed INT8 ConvRot expert execution). int8 convrot is a torch.matmul, byte-reproducible only within one fixed
 environment; the canonical surface is interceptor CPU (--device cpu,
 CUDA_VISIBLE_DEVICES=).
+
+The int4 job applies the same DG tensor-selection, group-size, and expert-bank policy
+as int8, then emits stock-ComfyUI convrot_w4a4 weights: signed W4 packed two values
+per byte, one FP32 scale per output row, and dynamic A4 activation quantization at
+runtime.
 
 The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
 the 60 MoE banks, 205 decoder-layer matrices, and the tied decoder token embedding
@@ -44,6 +49,7 @@ Precisions:
   mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
   int8_fused_qkv                int8 with one concatenated attention projection per block.
   int8_qkv_patch                repack an existing int8 artifact without requantization.
+  int4                          packed ConvRot W4 weights for native W4A4 execution.
 
 Examples:
   python convert_diffusion_gemma.py \
@@ -71,14 +77,18 @@ from safetensors.torch import save_file
 # int8 convrot is delegated to comfy-quants' stock-ComfyUI producer (byte-matches
 # ComfyUI's own save path), same as convert_gemma4.py.
 try:
+    from comfy_quants.backends.convrot_w4a4_model_export import _quantize_convrot_w4a4_per_row
     from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
+    from comfy_quants.formats.convrot_w4a4 import convrot_w4a4_checkpoint_quant_config
     from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
     from comfy_quants.formats.mxfp8_blocked import BLOCK_SIZE as MXFP8_BLOCK
     from comfy_quants.formats.mxfp8_blocked import quantize_mxfp8_block
 except ModuleNotFoundError as error:
     if error.name != "comfy_quants":
         raise
+    _quantize_convrot_w4a4_per_row = None
     _quantize_int8_tensorwise_per_row = None
+    convrot_w4a4_checkpoint_quant_config = None
     int8_tensorwise_checkpoint_quant_config = None
     quantize_mxfp8_block = None
     MXFP8_BLOCK = 32
@@ -496,6 +506,42 @@ def quantize_int8_bank(k, w, dev):
     }
 
 
+def quantize_int4_2d(k, w, dev):
+    if _quantize_convrot_w4a4_per_row is None:
+        raise SystemExit("int4 conversion requires comfy-quants with ConvRot W4A4 support")
+    base = k[:-len(".weight")]
+    gs = int8_groupsize(w.shape[1])
+    qweight, scale = _quantize_convrot_w4a4_per_row(
+        w.contiguous().to(dev), group_size=gs)
+    marker = convrot_w4a4_checkpoint_quant_config(convrot_groupsize=gs)
+    return {
+        f"{base}.weight": qweight.detach().to("cpu").contiguous(),
+        f"{base}.weight_scale": scale.detach().to("cpu").contiguous(),
+        f"{base}.comfy_quant": marker_tensor(marker),
+    }
+
+
+def quantize_int4_bank(k, w, dev):
+    if _quantize_convrot_w4a4_per_row is None:
+        raise SystemExit("int4 conversion requires comfy-quants with ConvRot W4A4 support")
+    base = k[:-len(".weight")]
+    num_experts, _, in_features = w.shape
+    gs = int8_groupsize(in_features)
+    if gs is None:
+        raise SystemExit(f"int4: no valid convrot groupsize for bank {k} (in_features {in_features})")
+    quantized = [
+        _quantize_convrot_w4a4_per_row(w[e].contiguous().to(dev), group_size=gs)
+        for e in range(num_experts)
+    ]
+    marker = convrot_w4a4_checkpoint_quant_config(convrot_groupsize=gs)
+    marker["num_experts"] = num_experts
+    return {
+        f"{base}.weight": torch.stack([item[0].detach().to("cpu") for item in quantized]).contiguous(),
+        f"{base}.weight_scale": torch.stack([item[1].detach().to("cpu") for item in quantized]).contiguous(),
+        f"{base}.comfy_quant": marker_tensor(marker),
+    }
+
+
 def cast(sd, precision, device="cpu"):
     if precision == "mxfp8_qkv_patch":
         out = dict(sd)
@@ -542,6 +588,15 @@ def cast(sd, precision, device="cpu"):
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
+        elif precision == "int4":
+            if is_expert_bank(k):
+                out.update(quantize_int4_bank(k, v, device))
+                nq += 1
+            elif int8_convrot_eligible_2d(k, v):
+                out.update(quantize_int4_2d(k, v, device))
+                nq += 1
+            else:
+                out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         else:
             raise SystemExit(f"unknown precision: {precision}")
     if precision == "mxfp8_fused_qkv":
@@ -550,7 +605,7 @@ def cast(sd, precision, device="cpu"):
     if precision == "int8_fused_qkv":
         fused = fuse_int8_attention_projections(out)
         print(f"{precision}: fused {fused} attention projection groups")
-    if precision in ("fp8", "mxfp8_fused", "mxfp8_fused_qkv", "int8", "int8_fused_qkv"):
+    if precision in ("fp8", "mxfp8_fused", "mxfp8_fused_qkv", "int8", "int8_fused_qkv", "int4"):
         print(f"{precision}: quantized {nq} weights")
     return out
 
@@ -561,7 +616,7 @@ def main():
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
     ap.add_argument("--device", default="cpu",
-                    help="int8 convrot device; cpu is the canonical byte-reproducible target "
+                    help="int8/int4 convrot device; cpu is the canonical byte-reproducible target "
                          "(interceptor CPU). bf16/fp8/MXFP8 jobs ignore this; "
                          "MXFP8 conversion always uses the deterministic CPU producer.")
     args = ap.parse_args()
