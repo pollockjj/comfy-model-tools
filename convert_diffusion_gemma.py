@@ -70,10 +70,18 @@ from safetensors.torch import save_file
 
 # int8 convrot is delegated to comfy-quants' stock-ComfyUI producer (byte-matches
 # ComfyUI's own save path), same as convert_gemma4.py.
-from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
-from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
-from comfy_quants.formats.mxfp8_blocked import BLOCK_SIZE as MXFP8_BLOCK
-from comfy_quants.formats.mxfp8_blocked import quantize_mxfp8_block
+try:
+    from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
+    from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
+    from comfy_quants.formats.mxfp8_blocked import BLOCK_SIZE as MXFP8_BLOCK
+    from comfy_quants.formats.mxfp8_blocked import quantize_mxfp8_block
+except ModuleNotFoundError as error:
+    if error.name != "comfy_quants":
+        raise
+    _quantize_int8_tensorwise_per_row = None
+    int8_tensorwise_checkpoint_quant_config = None
+    quantize_mxfp8_block = None
+    MXFP8_BLOCK = 32
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_INFO = torch.finfo(FP8_DTYPE)
@@ -185,6 +193,8 @@ def mxfp8_fused_conf():
 
 
 def quantize_mxfp8_fused_bank(k, w):
+    if quantize_mxfp8_block is None:
+        raise SystemExit("mxfp8 conversion requires comfy-quants")
     expected = next(
         (shapes for suffix, shapes in MXFP8_FUSED_BANK_SHAPES.items() if k.endswith(suffix)),
         None,
@@ -243,6 +253,8 @@ def mxfp8_eligible_2d(k, v):
 
 
 def quantize_mxfp8_2d(k, w):
+    if quantize_mxfp8_block is None:
+        raise SystemExit("mxfp8 conversion requires comfy-quants")
     if w.device.type != "cpu":
         raise SystemExit(f"mxfp8_fused: canonical conversion requires CPU source tensors ({k})")
     qweight, weight_scale = quantize_mxfp8_block(w.contiguous())
@@ -443,6 +455,8 @@ def int8_convrot_eligible_2d(k, v):
 
 
 def quantize_int8_2d(k, w, dev):
+    if _quantize_int8_tensorwise_per_row is None:
+        raise SystemExit("int8 conversion requires comfy-quants")
     base = k[:-len(".weight")]
     gs = int8_groupsize(w.shape[1])
     qweight, scale, rotated = _quantize_int8_tensorwise_per_row(
@@ -458,6 +472,8 @@ def quantize_int8_2d(k, w, dev):
 
 
 def quantize_int8_bank(k, w, dev):
+    if _quantize_int8_tensorwise_per_row is None:
+        raise SystemExit("int8 conversion requires comfy-quants")
     base = k[:-len(".weight")]
     num_experts, _, in_features = w.shape
     gs = int8_groupsize(in_features)
