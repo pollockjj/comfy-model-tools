@@ -25,8 +25,6 @@ The mxfp8_fused_qkv and int8_fused_qkv jobs additionally replace each decoder
 attention block's separate Q/K/V (or global Q/K) tensors with one qkv_proj
 tensor. The corresponding *_qkv_patch jobs perform only that payload-preserving
 structural rewrite on an existing artifact; they do not requantize any value.
-The int8_dense_mlp_patch job similarly concatenates each decoder dense MLP's
-already-quantized gate/up payloads into one gate_up_proj tensor.
 
 Base jobs keep HF naming (model.decoder.*, model.encoder.*), rename the fused expert
 banks to <bank>.weight (comfy.ops.MoEExperts), and embed tokenizer.json. QKV jobs also
@@ -46,7 +44,6 @@ Precisions:
   mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
   int8_fused_qkv                int8 with one concatenated attention projection per block.
   int8_qkv_patch                repack an existing int8 artifact without requantization.
-  int8_dense_mlp_patch          repack INT8 dense MLP gate/up payloads without requantization.
 
 Examples:
   python convert_diffusion_gemma.py \
@@ -103,11 +100,9 @@ MXFP8_FUSED_BANK_SHAPES = {
 }
 MXFP8_QKV_CONTRACT = "diffusiongemma_mxfp8_qkv_fused.v1"
 INT8_QKV_CONTRACT = "diffusiongemma_int8_convrot_qkv_fused.v1"
-INT8_DENSE_MLP_CONTRACT = "diffusiongemma_int8_convrot_dense_mlp_fused.v1"
 MXFP8_QKV_HIDDEN_SIZE = 2816
 MXFP8_QKV_SCALE_COLS = 88
 MXFP8_QKV_LAYER_COUNT = 30
-INT8_DENSE_MLP_INTERMEDIATE_SIZE = 2112
 MXFP8_SLIDING_PROJECTIONS = (("q_proj", 4096), ("k_proj", 2048), ("v_proj", 2048))
 MXFP8_GLOBAL_PROJECTIONS = (("q_proj", 8192), ("k_proj", 1024))
 
@@ -445,81 +440,6 @@ def fuse_int8_attention_projections(sd):
     return MXFP8_QKV_LAYER_COUNT
 
 
-def fuse_int8_dense_mlp_projections(sd):
-    """Replace DG's separate dense MLP INT8 gate/up projections without requantization."""
-    suffixes = ("weight", "weight_scale", "comfy_quant")
-    projections = ("gate_proj", "up_proj")
-    for layer in range(MXFP8_QKV_LAYER_COUNT):
-        mlp = f"model.decoder.layers.{layer}.mlp"
-        fused = f"{mlp}.gate_up_proj"
-        fused_keys = tuple(f"{fused}.{suffix}" for suffix in suffixes)
-        collisions = [key for key in fused_keys if key in sd]
-        if collisions:
-            raise SystemExit(f"int8 dense mlp: output keys already exist: {collisions}")
-
-        weights = []
-        scales = []
-        component_keys = []
-        for projection in projections:
-            base = f"{mlp}.{projection}"
-            weight_key, scale_key, marker_key = (f"{base}.{suffix}" for suffix in suffixes)
-            missing = [key for key in (weight_key, scale_key, marker_key) if key not in sd]
-            if missing:
-                raise SystemExit(f"int8 dense mlp: missing layer {layer} payload: {missing}")
-
-            weight = sd[weight_key]
-            scale = sd[scale_key]
-            marker = sd[marker_key]
-            expected_weight = (INT8_DENSE_MLP_INTERMEDIATE_SIZE, MXFP8_QKV_HIDDEN_SIZE)
-            expected_scale = (INT8_DENSE_MLP_INTERMEDIATE_SIZE, 1)
-            if (
-                weight.device.type != "cpu"
-                or weight.dtype != torch.int8
-                or tuple(weight.shape) != expected_weight
-                or not weight.is_contiguous()
-            ):
-                raise SystemExit(
-                    f"int8 dense mlp: invalid weight {weight_key}: {weight.dtype} {tuple(weight.shape)}"
-                )
-            if (
-                scale.device.type != "cpu"
-                or scale.dtype != torch.float32
-                or tuple(scale.shape) != expected_scale
-                or not scale.is_contiguous()
-            ):
-                raise SystemExit(
-                    f"int8 dense mlp: invalid scale {scale_key}: {scale.dtype} {tuple(scale.shape)}"
-                )
-            if marker.device.type != "cpu" or marker.dtype != torch.uint8 or marker.ndim != 1:
-                raise SystemExit(f"int8 dense mlp: invalid marker tensor {marker_key}")
-            try:
-                conf = json.loads(marker.numpy().tobytes())
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise SystemExit(f"int8 dense mlp: invalid marker JSON {marker_key}: {error}") from error
-            expected_conf = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
-            if any(conf.get(key) != value for key, value in expected_conf.items()):
-                raise SystemExit(f"int8 dense mlp: incompatible marker {marker_key}: {conf}")
-
-            weights.append(weight)
-            scales.append(scale)
-            component_keys.extend((weight_key, scale_key, marker_key))
-
-        sd[fused_keys[0]] = torch.cat(weights, dim=0).contiguous()
-        sd[fused_keys[1]] = torch.cat(scales, dim=0).contiguous()
-        sd[fused_keys[2]] = marker_tensor({
-            "format": "int8_tensorwise",
-            "convrot": True,
-            "convrot_groupsize": 256,
-            "artifact_contract": INT8_DENSE_MLP_CONTRACT,
-            "projection_order": list(projections),
-            "projection_splits": [INT8_DENSE_MLP_INTERMEDIATE_SIZE] * 2,
-        })
-        for key in component_keys:
-            del sd[key]
-
-    return MXFP8_QKV_LAYER_COUNT
-
-
 def int8_groupsize(in_features):
     return next((g for g in INT8_VALID_GS if in_features % g == 0), None)
 
@@ -586,11 +506,6 @@ def cast(sd, precision, device="cpu"):
         out = dict(sd)
         fused = fuse_int8_attention_projections(out)
         print(f"{precision}: fused {fused} attention projection groups without requantization")
-        return out
-    if precision == "int8_dense_mlp_patch":
-        out = dict(sd)
-        fused = fuse_int8_dense_mlp_projections(out)
-        print(f"{precision}: fused {fused} dense MLP projection groups without requantization")
         return out
 
     out = {}
