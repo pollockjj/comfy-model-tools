@@ -14,11 +14,10 @@ weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus 
 environment; the canonical surface is interceptor CPU (--device cpu,
 CUDA_VISIBLE_DEVICES=).
 
-The int4 job applies the same DG linear-selection, group-size, and expert-bank policy
-as int8, then emits stock-ComfyUI convrot_w4a4 weights: signed W4 packed two values
-per byte and one FP32 scale per output row. Every W4 linear uses dynamic A8
-activations because A4 corrupts DG over long generations. The tied decoder
-embedding uses the validated INT8 ConvRot representation.
+The int4 job emits stock-ComfyUI convrot_w4a4 weights only for the 60 routed-expert
+banks: signed W4 packed two values per byte, one FP32 scale per output row, and
+dynamic A4 activations. Every eligible nonexpert decoder linear and the tied decoder
+embedding use the validated INT8 ConvRot representation.
 
 The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
 the 60 MoE banks, 205 decoder-layer matrices, and the tied decoder token embedding
@@ -50,7 +49,7 @@ Precisions:
   mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
   int8_fused_qkv                int8 with one concatenated attention projection per block.
   int8_qkv_patch                repack an existing int8 artifact without requantization.
-  int4                          packed ConvRot W4 weights with A8 activations.
+  int4                          expert-only packed ConvRot W4A4; other decoder linears W8A8.
 
 Examples:
   python convert_diffusion_gemma.py \
@@ -541,10 +540,7 @@ def quantize_int4_bank(k, w, dev):
         _quantize_convrot_w4a4_per_row(w[e].contiguous().to(dev), group_size=gs)
         for e in range(num_experts)
     ]
-    marker = convrot_w4a4_checkpoint_quant_config(
-        convrot_groupsize=gs,
-        linear_dtype="int8",
-    )
+    marker = convrot_w4a4_checkpoint_quant_config(convrot_groupsize=gs)
     marker["num_experts"] = num_experts
     return {
         f"{base}.weight": torch.stack([item[0].detach().to("cpu") for item in quantized]).contiguous(),
@@ -603,11 +599,8 @@ def cast(sd, precision, device="cpu"):
             if is_expert_bank(k):
                 out.update(quantize_int4_bank(k, v, device))
                 nq += 1
-            elif k == MXFP8_TIED_EMBEDDING_KEY:
+            elif int8_convrot_eligible_2d(k, v):
                 out.update(quantize_int8_2d(k, v, device))
-                nq += 1
-            elif int4_convrot_eligible_2d(k, v):
-                out.update(quantize_int4_2d(k, v, device))
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v

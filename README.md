@@ -9,8 +9,8 @@ text encoder with repeatable `--job` arguments. It supports `bf16`, `fp8`, full-
 `int8` ConvRot, packed-W4 `int4`, fused-bank `mxfp8_fused`, fused-bank plus fused-attention
 `mxfp8_fused_qkv`, and the payload-preserving `mxfp8_qkv_patch`. The MXFP8 jobs
 quantize the tied decoder token embedding as well as decoder matrices and expert
-banks. The `int4` job stores every eligible decoder linear as W4, runs every W4
-linear with A8 activations, and stores the tied embedding as INT8 ConvRot.
+banks. The `int4` job stores only the routed-expert banks as W4A4. Every eligible
+nonexpert decoder linear and the tied embedding remain INT8 ConvRot W8A8.
 
 ```sh
 python convert_diffusion_gemma.py --src /path/to/source \
