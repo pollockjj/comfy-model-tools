@@ -14,10 +14,11 @@ weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus 
 environment; the canonical surface is interceptor CPU (--device cpu,
 CUDA_VISIBLE_DEVICES=).
 
-The int4 job applies the same DG tensor-selection, group-size, and expert-bank policy
+The int4 job applies the same DG linear-selection, group-size, and expert-bank policy
 as int8, then emits stock-ComfyUI convrot_w4a4 weights: signed W4 packed two values
 per byte, one FP32 scale per output row, and dynamic A4 activation quantization at
-runtime.
+runtime. The tied decoder embedding remains BF16 because Comfy initializes embedding
+dimensions from the stored tensor shape before applying quantized linear layouts.
 
 The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
 the 60 MoE banks, 205 decoder-layer matrices, and the tied decoder token embedding
@@ -464,6 +465,10 @@ def int8_convrot_eligible_2d(k, v):
     return int8_groupsize(v.shape[1]) is not None
 
 
+def int4_convrot_eligible_2d(k, v):
+    return k != MXFP8_TIED_EMBEDDING_KEY and int8_convrot_eligible_2d(k, v)
+
+
 def quantize_int8_2d(k, w, dev):
     if _quantize_int8_tensorwise_per_row is None:
         raise SystemExit("int8 conversion requires comfy-quants")
@@ -592,7 +597,7 @@ def cast(sd, precision, device="cpu"):
             if is_expert_bank(k):
                 out.update(quantize_int4_bank(k, v, device))
                 nq += 1
-            elif int8_convrot_eligible_2d(k, v):
+            elif int4_convrot_eligible_2d(k, v):
                 out.update(quantize_int4_2d(k, v, device))
                 nq += 1
             else:
