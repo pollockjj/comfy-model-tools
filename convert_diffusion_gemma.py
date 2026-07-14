@@ -21,10 +21,10 @@ values plus per-32-element UE8M0 scales in CUTLASS/cublas 128x4 blocked layout. 
 expert banks use the strict mxfp8_cutlass_fused_moe_v1 marker; activation
 microscaling is dynamic at runtime.
 
-The mxfp8_fused_qkv job additionally replaces each decoder attention block's
-separate Q/K/V (or global Q/K) MXFP8 tensors with one qkv_proj tensor. The
-mxfp8_qkv_patch job performs only that payload-preserving structural rewrite on
-an existing all-linears MXFP8 safetensors file; it does not requantize any value.
+The mxfp8_fused_qkv and int8_fused_qkv jobs additionally replace each decoder
+attention block's separate Q/K/V (or global Q/K) tensors with one qkv_proj
+tensor. The corresponding *_qkv_patch jobs perform only that payload-preserving
+structural rewrite on an existing artifact; they do not requantize any value.
 
 Base jobs keep HF naming (model.decoder.*, model.encoder.*), rename the fused expert
 banks to <bank>.weight (comfy.ops.MoEExperts), and embed tokenizer.json. QKV jobs also
@@ -42,6 +42,8 @@ Precisions:
                                 UE8M0 scales in CUTLASS 128x4 layout.
   mxfp8_fused_qkv               mxfp8_fused with one concatenated attention projection per block.
   mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
+  int8_fused_qkv                int8 with one concatenated attention projection per block.
+  int8_qkv_patch                repack an existing int8 artifact without requantization.
 
 Examples:
   python convert_diffusion_gemma.py \
@@ -89,6 +91,7 @@ MXFP8_FUSED_BANK_SHAPES = {
     ".experts.down_proj.weight": ((128, 2816, 704), (128, 2816, 24)),
 }
 MXFP8_QKV_CONTRACT = "diffusiongemma_mxfp8_qkv_fused.v1"
+INT8_QKV_CONTRACT = "diffusiongemma_int8_convrot_qkv_fused.v1"
 MXFP8_QKV_HIDDEN_SIZE = 2816
 MXFP8_QKV_SCALE_COLS = 88
 MXFP8_QKV_LAYER_COUNT = 30
@@ -341,6 +344,90 @@ def fuse_mxfp8_attention_projections(sd):
     return MXFP8_QKV_LAYER_COUNT
 
 
+def fuse_int8_attention_projections(sd):
+    """Replace DG's separate INT8 ConvRot projections without requantization."""
+    for layer in range(MXFP8_QKV_LAYER_COUNT):
+        projections = (
+            MXFP8_GLOBAL_PROJECTIONS if layer % 6 == 5 else MXFP8_SLIDING_PROJECTIONS
+        )
+        attention = f"model.decoder.layers.{layer}.self_attn"
+        fused = f"{attention}.qkv_proj"
+        suffixes = ("weight", "weight_scale", "comfy_quant")
+        fused_keys = tuple(f"{fused}.{suffix}" for suffix in suffixes)
+        collisions = [key for key in fused_keys if key in sd]
+        if collisions:
+            raise SystemExit(f"int8 qkv: output keys already exist: {collisions}")
+
+        projection_names = {projection for projection, _ in projections}
+        unexpected = [
+            f"{attention}.{projection}.{suffix}"
+            for projection in ("q_proj", "k_proj", "v_proj")
+            if projection not in projection_names
+            for suffix in suffixes
+            if f"{attention}.{projection}.{suffix}" in sd
+        ]
+        if unexpected:
+            raise SystemExit(f"int8 qkv: unexpected layer {layer} payload: {unexpected}")
+
+        weights = []
+        scales = []
+        component_keys = []
+        for projection, out_features in projections:
+            base = f"{attention}.{projection}"
+            weight_key, scale_key, marker_key = (f"{base}.{suffix}" for suffix in suffixes)
+            missing = [key for key in (weight_key, scale_key, marker_key) if key not in sd]
+            if missing:
+                raise SystemExit(f"int8 qkv: missing layer {layer} payload: {missing}")
+
+            weight = sd[weight_key]
+            scale = sd[scale_key]
+            marker = sd[marker_key]
+            expected_weight = (out_features, MXFP8_QKV_HIDDEN_SIZE)
+            expected_scale = (out_features, 1)
+            if (
+                weight.device.type != "cpu"
+                or weight.dtype != torch.int8
+                or tuple(weight.shape) != expected_weight
+                or not weight.is_contiguous()
+            ):
+                raise SystemExit(f"int8 qkv: invalid weight {weight_key}: {weight.dtype} {tuple(weight.shape)}")
+            if (
+                scale.device.type != "cpu"
+                or scale.dtype != torch.float32
+                or tuple(scale.shape) != expected_scale
+                or not scale.is_contiguous()
+            ):
+                raise SystemExit(f"int8 qkv: invalid scale {scale_key}: {scale.dtype} {tuple(scale.shape)}")
+            if marker.device.type != "cpu" or marker.dtype != torch.uint8 or marker.ndim != 1:
+                raise SystemExit(f"int8 qkv: invalid marker tensor {marker_key}")
+            try:
+                conf = json.loads(marker.numpy().tobytes())
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SystemExit(f"int8 qkv: invalid marker JSON {marker_key}: {error}") from error
+            expected_conf = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
+            if any(conf.get(key) != value for key, value in expected_conf.items()):
+                raise SystemExit(f"int8 qkv: incompatible marker {marker_key}: {conf}")
+
+            weights.append(weight)
+            scales.append(scale)
+            component_keys.extend((weight_key, scale_key, marker_key))
+
+        sd[fused_keys[0]] = torch.cat(weights, dim=0).contiguous()
+        sd[fused_keys[1]] = torch.cat(scales, dim=0).contiguous()
+        sd[fused_keys[2]] = marker_tensor({
+            "format": "int8_tensorwise",
+            "convrot": True,
+            "convrot_groupsize": 256,
+            "artifact_contract": INT8_QKV_CONTRACT,
+            "projection_order": [projection for projection, _ in projections],
+            "projection_splits": [out_features for _, out_features in projections],
+        })
+        for key in component_keys:
+            del sd[key]
+
+    return MXFP8_QKV_LAYER_COUNT
+
+
 def int8_groupsize(in_features):
     return next((g for g in INT8_VALID_GS if in_features % g == 0), None)
 
@@ -399,6 +486,11 @@ def cast(sd, precision, device="cpu"):
         fused = fuse_mxfp8_attention_projections(out)
         print(f"{precision}: fused {fused} attention projection groups without requantization")
         return out
+    if precision == "int8_qkv_patch":
+        out = dict(sd)
+        fused = fuse_int8_attention_projections(out)
+        print(f"{precision}: fused {fused} attention projection groups without requantization")
+        return out
 
     out = {}
     nq = 0
@@ -425,7 +517,7 @@ def cast(sd, precision, device="cpu"):
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
-        elif precision == "int8":
+        elif precision in ("int8", "int8_fused_qkv"):
             if is_expert_bank(k):
                 out.update(quantize_int8_bank(k, v, device))
                 nq += 1
@@ -439,7 +531,10 @@ def cast(sd, precision, device="cpu"):
     if precision == "mxfp8_fused_qkv":
         fused = fuse_mxfp8_attention_projections(out)
         print(f"{precision}: fused {fused} attention projection groups")
-    if precision in ("fp8", "mxfp8_fused", "mxfp8_fused_qkv", "int8"):
+    if precision == "int8_fused_qkv":
+        fused = fuse_int8_attention_projections(out)
+        print(f"{precision}: fused {fused} attention projection groups")
+    if precision in ("fp8", "mxfp8_fused", "mxfp8_fused_qkv", "int8", "int8_fused_qkv"):
         print(f"{precision}: quantized {nq} weights")
     return out
 
