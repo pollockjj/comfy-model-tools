@@ -6,16 +6,19 @@ Utility scripts for packaging models for ComfyUI.
 
 `convert_diffusion_gemma.py` converts a DiffusionGemma HF snapshot or ComfyUI BF16
 text encoder with repeatable `--job` arguments. It supports `bf16`, `fp8`, full-map
-`int8` ConvRot, fused-bank `mxfp8_fused`, fused-bank plus fused-attention
+`int8` ConvRot, packed-W4 `int4`, fused-bank `mxfp8_fused`, fused-bank plus fused-attention
 `mxfp8_fused_qkv`, and the payload-preserving `mxfp8_qkv_patch`. The MXFP8 jobs
 quantize the tied decoder token embedding as well as decoder matrices and expert
-banks.
+banks. The `int4` job stores every eligible decoder linear as W4, runs expert banks
+with A4 activations and nonexpert linears with A8 activations, and stores the tied
+embedding as INT8 ConvRot.
 
 ```sh
 python convert_diffusion_gemma.py --src /path/to/source \
     --job bf16:/path/to/diffusiongemma_bf16.safetensors \
     --job fp8:/path/to/diffusiongemma_fp8.safetensors \
     --job int8:/path/to/diffusiongemma_int8_convrot.safetensors \
+    --job int4:/path/to/diffusiongemma_int4_convrot.safetensors \
     --job mxfp8_fused_qkv:/path/to/diffusiongemma_mxfp8.safetensors
 ```
 

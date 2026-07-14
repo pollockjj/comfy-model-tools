@@ -16,9 +16,9 @@ CUDA_VISIBLE_DEVICES=).
 
 The int4 job applies the same DG linear-selection, group-size, and expert-bank policy
 as int8, then emits stock-ComfyUI convrot_w4a4 weights: signed W4 packed two values
-per byte, one FP32 scale per output row, and dynamic A4 activation quantization at
-runtime. The tied decoder embedding remains BF16 because Comfy initializes embedding
-dimensions from the stored tensor shape before applying quantized linear layouts.
+per byte and one FP32 scale per output row. Expert banks use dynamic A4 activations;
+nonexpert W4 linears use dynamic A8 activations because model-wide A4 corrupts DG.
+The tied decoder embedding uses the validated INT8 ConvRot representation.
 
 The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
 the 60 MoE banks, 205 decoder-layer matrices, and the tied decoder token embedding
@@ -50,7 +50,7 @@ Precisions:
   mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
   int8_fused_qkv                int8 with one concatenated attention projection per block.
   int8_qkv_patch                repack an existing int8 artifact without requantization.
-  int4                          packed ConvRot W4 weights for native W4A4 execution.
+  int4                          packed ConvRot W4 weights; expert A4, nonexpert A8.
 
 Examples:
   python convert_diffusion_gemma.py \
@@ -518,7 +518,10 @@ def quantize_int4_2d(k, w, dev):
     gs = int8_groupsize(w.shape[1])
     qweight, scale = _quantize_convrot_w4a4_per_row(
         w.contiguous().to(dev), group_size=gs)
-    marker = convrot_w4a4_checkpoint_quant_config(convrot_groupsize=gs)
+    marker = convrot_w4a4_checkpoint_quant_config(
+        convrot_groupsize=gs,
+        linear_dtype="int8",
+    )
     return {
         f"{base}.weight": qweight.detach().to("cpu").contiguous(),
         f"{base}.weight_scale": scale.detach().to("cpu").contiguous(),
@@ -596,6 +599,9 @@ def cast(sd, precision, device="cpu"):
         elif precision == "int4":
             if is_expert_bank(k):
                 out.update(quantize_int4_bank(k, v, device))
+                nq += 1
+            elif k == MXFP8_TIED_EMBEDDING_KEY:
+                out.update(quantize_int8_2d(k, v, device))
                 nq += 1
             elif int4_convrot_eligible_2d(k, v):
                 out.update(quantize_int4_2d(k, v, device))
