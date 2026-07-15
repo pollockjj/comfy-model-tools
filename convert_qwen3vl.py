@@ -2,11 +2,10 @@
 """
 Convert Qwen3-VL 4B / 8B checkpoints to ComfyUI text-encoder safetensors.
 
-Rev1 deterministic release converter for the shipped Comfy-Org Qwen3-VL text
-encoders. Rev0 and its measured failures are preserved in git commit 32c6f49
-and QWEN_CONVERTER_PROVENANCE.md.
+Rev0 deterministic release converter for the shipped Comfy-Org Qwen3-VL text
+encoders.
 
-Rev1 accepts only the pinned original Qwen checkpoints listed below and always
+Rev0 accepts only the pinned original Qwen checkpoints listed below and always
 checks the complete output file against the embedded canonical release SHA256.
 
 Pinned sources:
@@ -254,7 +253,7 @@ def cast(sd, precision, comfyui_root):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Qwen3-VL Rev1 deterministic release converter.")
+    ap = argparse.ArgumentParser(description="Qwen3-VL Rev0 deterministic release converter.")
     ap.add_argument("--src", required=True, help="pinned original HF snapshot directory")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
