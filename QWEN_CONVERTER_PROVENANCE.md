@@ -29,3 +29,11 @@ but cannot serve as the family converter.
 Rev1 must retain none of these defects. It is accepted only after each artifact
 it claims is regenerated in full and its complete-file SHA256 is identical to
 the canonical Hugging Face artifact.
+
+## Rev1
+
+Rev1 starts from exact pinned original-source shard SHA256 values, uses
+variant-defined release metadata, embeds every canonical output SHA256, and
+fails if the source, requested artifact, caller-supplied SHA, or generated file
+does not match that provenance. Qwen3-VL FP8 uses float32 reciprocal
+multiplication, not Rev0 division.

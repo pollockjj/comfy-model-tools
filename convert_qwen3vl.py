@@ -2,25 +2,25 @@
 """
 Convert Qwen3-VL 4B / 8B checkpoints to ComfyUI text-encoder safetensors.
 
-REV0 HISTORICAL PROVENANCE ONLY. DO NOT USE THIS AS A RELEASE RECIPE.
+Rev1 deterministic release converter for the shipped Comfy-Org Qwen3-VL text
+encoders. Rev0 and its measured failures are preserved in git commit 32c6f49
+and QWEN_CONVERTER_PROVENANCE.md.
 
-This file records the first attempted reconstruction committed as 1c21d4d. Its
-FP8 scale arithmetic is wrong: ``amax / 416.0`` does not reproduce the released
-artifacts. The observed 4B FP8 output is
-de5204f63b883abfdf32c54a28f173b43cc3f580f7ecb31d04a6793ba84b168a,
-not the canonical
-54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094.
-This behavior is retained unchanged for posterity and provenance. Rev1 will
-replace it with verified release arithmetic.
+Rev1 accepts only the pinned original Qwen checkpoints listed below and always
+checks the complete output file against the embedded canonical release SHA256.
 
-The attempted conversion conventions were:
+Pinned sources:
+  Qwen/Qwen3-VL-4B-Instruct @ ebb281ec70b05090aa6165b016eac8ec08e71b17
+  Qwen/Qwen3-VL-8B-Instruct @ 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+
+Released conversion conventions:
 
 Precisions:
   bf16                          release BF16 repack. 4B carries no safetensors
                                 metadata; 8B carries {"format": "pt"}.
   fp8_scaled                    language-model 2D projection weights only
                                 (36 layers x 7 linears) -> float8_e4m3fn,
-                                scalar scale = amax / 416, marker
+                                scalar scale = amax * float32(1 / 416), marker
                                 full_precision_matrix_mult=false.
   nvfp4                         8B only: lm_head and embed_tokens -> the same
                                 fp8_scaled path; the 36 x 7 projection weights
@@ -28,17 +28,16 @@ Precisions:
                                 from BF16 arithmetic. Everything else bf16.
 
 Examples:
-  python convert_qwen3vl.py --src qwen3vl_4b_bf16.safetensors \
-      --job bf16:qwen3vl_4b_bf16.safetensors:36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34 \
-      --job fp8_scaled:qwen3vl_4b_fp8_scaled.safetensors:54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094
+  python convert_qwen3vl.py --src Qwen3-VL-4B-Instruct-snapshot \
+      --job bf16:qwen3vl_4b_bf16.safetensors \
+      --job fp8_scaled:qwen3vl_4b_fp8_scaled.safetensors
 
   PYTHONPATH=/home/johnj/dev_master/ComfyUI python convert_qwen3vl.py \
-      --src qwen3vl_8b_bf16.safetensors \
-      --job nvfp4:qwen3vl_8b_nvfp4.safetensors:e462e9e0c3b9313ae17f82040d7c77beb92d7aef3e40692d7803228dab7c3b98
+      --src Qwen3-VL-8B-Instruct-snapshot \
+      --job nvfp4:qwen3vl_8b_nvfp4.safetensors
 
-A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written
-file. Source may be an existing released/ComfyUI bf16 safetensors or an HF
-snapshot directory containing model.safetensors or model-*-of-*.safetensors.
+The optional SHA256 in PRECISION:OUT:SHA256 is accepted only when it equals the
+embedded canonical SHA. Source must be the pinned original HF snapshot.
 """
 import argparse
 import glob
@@ -55,6 +54,7 @@ from safetensors.torch import save_file
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_INFO = torch.finfo(FP8_DTYPE)
 FP8_MAX = 416.0
+FP8_RECIPROCAL = torch.tensor(1.0 / FP8_MAX, dtype=torch.float32)
 FP8_CONF = {"format": "float8_e4m3fn", "full_precision_matrix_mult": False}
 NVFP4_CONF = {"format": "nvfp4"}
 LM_PROJECTION_LEAVES = (
@@ -66,6 +66,27 @@ LM_PROJECTION_LEAVES = (
     "self_attn.q_proj.weight",
     "self_attn.v_proj.weight",
 )
+
+PINNED_SOURCE_SHAS = {
+    "qwen3vl_4b": (
+        "30a01a0556622645a3cce87b655bbbbbc1f170c196099f1b666c93202c3339a9",
+        "046296a2a387efb43b0c997d5833c789604d168834f6e0d3064bf7bb13d002a6",
+    ),
+    "qwen3vl_8b": (
+        "d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa",
+        "8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5",
+        "83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192",
+        "0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5",
+    ),
+}
+
+EXPECTED_SHAS = {
+    ("qwen3vl_4b", "bf16"): "36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34",
+    ("qwen3vl_4b", "fp8_scaled"): "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094",
+    ("qwen3vl_8b", "bf16"): "68bdc82bc1b66851162ae656225e7e2068166b603db19bd5d5a3b90eb12669a9",
+    ("qwen3vl_8b", "fp8_scaled"): "4ba424cf62e51392e4d1a39933e803706f4e823c1065f36aaf149c6453f66bcd",
+    ("qwen3vl_8b", "nvfp4"): "e462e9e0c3b9313ae17f82040d7c77beb92d7aef3e40692d7803228dab7c3b98",
+}
 
 
 def sha256(path):
@@ -92,21 +113,26 @@ def iter_safetensors(src):
     return shards
 
 
-def load_base(src):
-    files = iter_safetensors(src)
+def identify_pinned_source(files):
+    digests = tuple(sha256(file) for file in files)
+    for variant, expected in PINNED_SOURCE_SHAS.items():
+        if digests == expected:
+            print(f"verified pinned source: {variant}")
+            return variant
+    raise SystemExit(f"unrecognized source shard SHA256 tuple: {digests}")
+
+
+def load_base(files):
     out = {}
-    source_metadata = None
     for file in files:
         with safe_open(file, framework="pt", device="cpu") as st:
-            if source_metadata is None:
-                source_metadata = st.metadata()
             for key in st.keys():
                 t = st.get_tensor(key)
                 if t.is_floating_point():
                     t = t.to(torch.bfloat16)
                 out[key] = t
     print(f"loaded Qwen3-VL source: {len(out)} tensors, {len(files)} file(s)")
-    return out, source_metadata
+    return out
 
 
 def remap_language_key(k):
@@ -140,22 +166,16 @@ def is_lm_projection_weight(k):
 
 
 def model_variant(sd):
-    if any(k.startswith("model.language_model.") for k in sd):
-        return "qwen3vl_4b"
     hidden = sd.get("model.visual.merger.linear_fc2.weight")
     if torch.is_tensor(hidden) and hidden.shape[0] == 4096:
         return "qwen3vl_8b"
-    if "lm_head.weight" in sd:
-        return "qwen3vl_8b"
-    return "qwen3vl_4b"
+    if torch.is_tensor(hidden) and hidden.shape[0] == 2560:
+        return "qwen3vl_4b"
+    raise SystemExit("source tensors do not identify a supported Qwen3-VL variant")
 
 
-def bf16_metadata(variant, source_metadata):
-    if source_metadata and source_metadata.get("format") == "pt":
-        return {"format": "pt"}
-    if variant == "qwen3vl_8b":
-        return {"format": "pt"}
-    return None
+def bf16_metadata(variant):
+    return {"format": "pt"} if variant == "qwen3vl_8b" else None
 
 
 def quantized_metadata():
@@ -166,7 +186,7 @@ def quantize_fp8_scaled_weight(k, v, out_key=None):
     mapped = out_key or remap_language_key(k)
     base = mapped[:-len(".weight")]
     w = v.float()
-    scale = torch.max(torch.abs(w)) / FP8_MAX
+    scale = torch.max(torch.abs(w)) * FP8_RECIPROCAL
     q = (w / scale).clamp(min=FP8_INFO.min, max=FP8_INFO.max).to(FP8_DTYPE)
     return {
         f"{base}.weight": q.cpu().contiguous(),
@@ -234,16 +254,20 @@ def cast(sd, precision, comfyui_root):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Qwen3-VL Rev0 historical reconstruction; rejected for release use.")
-    ap.add_argument("--src", required=True, help="HF snapshot dir or ComfyUI/released bf16 safetensors")
+    ap = argparse.ArgumentParser(description="Qwen3-VL Rev1 deterministic release converter.")
+    ap.add_argument("--src", required=True, help="pinned original HF snapshot directory")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
     ap.add_argument("--comfyui-root", default="/home/johnj/dev_master/ComfyUI",
                     help="ComfyUI checkout used for Rev1 nvfp4 reproduction")
     args = ap.parse_args()
 
-    base, source_metadata = load_base(args.src)
-    variant = model_variant(base)
+    files = iter_safetensors(args.src)
+    variant = identify_pinned_source(files)
+    base = load_base(files)
+    detected_variant = model_variant(base)
+    if detected_variant != variant:
+        raise SystemExit(f"source identity mismatch: hashes={variant}, tensors={detected_variant}")
     mismatched = []
     for job in args.job:
         precision, sep, remainder = job.partition(":")
@@ -253,8 +277,14 @@ def main():
         head, sha_sep, tail = remainder.rpartition(":")
         if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
             out, expected = head, tail.lower()
+        canonical = EXPECTED_SHAS.get((variant, precision))
+        if canonical is None:
+            raise SystemExit(f"no released artifact for {variant} {precision}")
+        if expected is not None and expected != canonical:
+            raise SystemExit(f"caller SHA256 does not equal canonical SHA256 for {variant} {precision}")
+        expected = canonical
         tensors = cast(base, precision, args.comfyui_root)
-        metadata = bf16_metadata(variant, source_metadata) if precision == "bf16" else quantized_metadata()
+        metadata = bf16_metadata(variant) if precision == "bf16" else quantized_metadata()
         save_file(tensors, out, metadata=metadata)
         digest = sha256(out)
         verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
