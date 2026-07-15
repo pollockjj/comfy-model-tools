@@ -13,7 +13,7 @@ NVFP4 kernel optimization.
 |:--|:--|
 | Recovered working-first source SHA256 | `a033cb9ee0c73290b33b50a7542100d1a76cf17fb0be4ba1c821f123a764e45b` |
 | Recovered source size | `8,153` bytes / `214` lines |
-| Public portable source | `convert_diffusion_gemma_block_formats.py` |
+| Public portable source | `convert_diffusion_gemma.py --job nvfp4:OUT` |
 | Public portable source SHA256 | `f19794a9cb6effda63c6eafffa0add3e3dd50f9f9d3160f3ba34dbe98b0bab00` |
 | Converter commit | `55ca0b82eac53773a9e548b240737e1847f8304c` |
 
@@ -48,11 +48,9 @@ The historical working-first run selected both formats. The NVFP4-only equivalen
 ```sh
 COMFYUI_ROOT=/path/to/ComfyUI \
 CUDA_VISIBLE_DEVICES=0 \
-/path/to/python convert_diffusion_gemma_block_formats.py \
+/path/to/python convert_diffusion_gemma.py \
     --src /path/to/diffusiongemma_comfy_bf16.safetensors \
-    --format nvfp4 \
-    --out-nvfp4 /path/to/diffusiongemma_comfy_nvfp4_working.safetensors \
-    --manifest /path/to/conversion_manifest.json
+    --job nvfp4:/path/to/diffusiongemma_comfy_nvfp4_working.safetensors
 ```
 
 Requirements are a CUDA-capable PyTorch environment, `safetensors`, a ComfyUI checkout

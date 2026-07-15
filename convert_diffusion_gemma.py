@@ -1,74 +1,28 @@
 #!/usr/bin/env python3
-"""
-Convert DiffusionGemma-26B-A4B checkpoints to ComfyUI text-encoder safetensors.
+"""Create the six canonical ComfyUI DiffusionGemma-26B-A4B artifacts.
 
-V3 = V2 + int8/int4 convrot + fused MXFP8 experts. The bf16 and fp8 jobs are V2's exact
-code, byte-identical to V2 (495d347e / 3d26c504). The int8 job is full-map decoder
-int8_tensorwise convrot via the comfy-quants stock-ComfyUI producer: 2D decoder
-weights (embeddings + attention + dense-MLP; router and encoder stay bf16) plus the
-3D MoE expert banks quantized per-expert and restacked ([E, out, in] int8 +
-[E, out, 1] per-row scales + num_experts marker). Groupsize per weight: largest of
-(256, 64) dividing in_features (gate_up 2816 -> 256; down 704 -> 64; dense mlp.down
-2112 -> 64). Requires ComfyUI `diffusion-gemma-finish-dg` containing `a362a5e5`
-(packed INT8 ConvRot expert execution). int8 convrot is a torch.matmul, byte-reproducible only within one fixed
-environment; the canonical surface is interceptor CPU (--device cpu,
-CUDA_VISIBLE_DEVICES=).
+Source: google/diffusiongemma-26B-A4B-it revision 0f28bc42. Each public job is the
+single accepted recipe for its quant and must match the fixed SHA256 below:
 
-The int4 job emits stock-ComfyUI convrot_w4a4 weights only for the 60 routed-expert
-banks: signed W4 packed two values per byte, one FP32 scale per output row, and
-dynamic A4 activations. Every eligible nonexpert decoder linear and the tied decoder
-embedding use the validated INT8 ConvRot representation.
+  bf16   BF16 mapped checkpoint                                      495d347e...
+  fp8    Kijai scaled FP8                                            3d26c504...
+  int8   full-map CPU ConvRot W8A8 with fused QKV                    1cdeb5de...
+  int4   routed-expert CPU ConvRot W4A8, remaining linears W8A8      7d95437c...
+  mxfp8  fused experts, decoder linears, tied embedding, fused QKV    211f3140...
+  nvfp4  rev-0 split experts and 205 decoder linears                 a07a8cda...
 
-The mxfp8_fused job keeps DiffusionGemma's natural fused gate_up bank and quantizes
-the 60 MoE banks, 205 decoder-layer matrices, and the tied decoder token embedding
-with comfy-quants' deterministic CPU MXFP8 producer. Each weight stores FP8-E4M3
-values plus per-32-element UE8M0 scales in CUTLASS/cublas 128x4 blocked layout. The
-expert banks use the strict mxfp8_cutlass_fused_moe_v1 marker; activation
-microscaling is dynamic at runtime.
-
-The mxfp8_fused_qkv and int8_fused_qkv jobs additionally replace each decoder
-attention block's separate Q/K/V (or global Q/K) tensors with one qkv_proj
-tensor. The corresponding *_qkv_patch jobs perform only that payload-preserving
-structural rewrite on an existing artifact; they do not requantize any value.
-
-Base jobs keep HF naming (model.decoder.*, model.encoder.*), rename the fused expert
-banks to <bank>.weight (comfy.ops.MoEExperts), and embed tokenizer.json. QKV jobs also
-replace attention projection component keys with qkv_proj. lm_head.* is dropped.
-
-Precisions:
-  bf16                          every float tensor -> bfloat16; expert banks -> <bank>.weight.
-  fp8                           Kijai FP8 V1 (max_value=416): expert banks (3D) -> float8_e4m3fn
-                                with per-expert scale (amax over dims 1,2 / 416); large 2D
-                                text-backbone weights (model.decoder.layers.*, max(shape) >= 4096,
-                                non-norm) -> float8_e4m3fn per-tensor scale (amax / 416).
-                                Everything else -> bfloat16.
-  mxfp8_fused                   natural fused gate_up + down 3D expert banks -> float8_e4m3fn
-                                and decoder-layer matrices -> float8_e4m3fn with per-32-element
-                                UE8M0 scales in CUTLASS 128x4 layout.
-  mxfp8_fused_qkv               mxfp8_fused with one concatenated attention projection per block.
-  mxfp8_qkv_patch               repack an existing mxfp8_fused artifact without requantization.
-  int8_fused_qkv                int8 with one concatenated attention projection per block.
-  int8_qkv_patch                repack an existing int8 artifact without requantization.
-  int4                          expert-only packed ConvRot W4A4; other decoder linears W8A8.
-
-Examples:
-  python convert_diffusion_gemma.py \
-      --src ~/.cache/huggingface/hub/models--google--diffusiongemma-26B-A4B-it/snapshots/<rev> \
-      --job bf16:diffusiongemma_comfy_bf16.safetensors:495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1 \
-      --job fp8:diffusiongemma_comfy_fp8.safetensors:3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015 \
-      --job mxfp8_fused:diffusiongemma_comfy_mxfp8_cutlass_fused_moe_v1.safetensors
-
-A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written file.
-
-Reproducibility: both jobs are matmul-free (bf16 passthrough; fp8 is per-expert / per-tensor
-amax/416, elementwise), so output is byte-identical on any machine/device. Verified on
-interceptor CPU: bf16 495d347e and fp8 3d26c504 both match the shipped HF files exactly.
+There are no public patch, intermediate, or alternate-layout jobs. Structural
+fusion is part of the canonical INT8 and MXFP8 recipes. The accepted SHA is not a
+caller option: every conversion verifies it and fails on any byte drift.
 """
 import argparse
+import collections
 import glob
 import hashlib
 import json
 import os
+import sys
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -115,6 +69,25 @@ MXFP8_QKV_SCALE_COLS = 88
 MXFP8_QKV_LAYER_COUNT = 30
 MXFP8_SLIDING_PROJECTIONS = (("q_proj", 4096), ("k_proj", 2048), ("v_proj", 2048))
 MXFP8_GLOBAL_PROJECTIONS = (("q_proj", 8192), ("k_proj", 1024))
+CANONICAL_SHA256 = {
+    "bf16": "495d347e1b6c1aa13338741a17d1f5632f3ad4adb11f85f8eeb6ec026db418d1",
+    "fp8": "3d26c504c323bc78fa2d51dbc8433ba4ccf45dcb015b46122d2e37e4c4496015",
+    "int8": "1cdeb5deb7f553257c06a54dffc47be2b3242781808319840074e1bcbfe48401",
+    "int4": "7d95437cf72720302d672c70695251d6c17f5c755f1e7842436db62d1459f881",
+    "mxfp8": "211f31404bc1ad56a912912dac3caacb0e420a0c0d31aba30a537e3c3370bce7",
+    "nvfp4": "a07a8cdacd46fb106a718bf07a628645f078c306eb7e2097dfcff4b5f7677cdc",
+}
+NVFP4_ATTN_SUFFIXES = (
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+)
+NVFP4_MLP_SUFFIXES = (
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
+)
 
 
 def sha256(path):
@@ -127,6 +100,16 @@ def sha256(path):
 
 def marker_tensor(conf):
     return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+
+
+def compact_marker_tensor(conf):
+    data = json.dumps(conf, separators=(",", ":")).encode("utf-8")
+    return torch.tensor(list(data), dtype=torch.uint8)
+
+
+def sorted_marker_tensor(conf):
+    data = json.dumps(conf, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return torch.tensor(list(data), dtype=torch.uint8)
 
 
 def load_base(src):
@@ -185,6 +168,65 @@ def quantize_2d(k, w):
         f"{base}.weight_scale": scale,
         f"{base}.comfy_quant": marker_tensor({"format": "float8_e4m3fn"}),
     }
+
+
+def nvfp4_layout():
+    comfy_root = Path(os.environ.get("COMFYUI_ROOT", Path.home() / "dev_master" / "ComfyUI"))
+    sys.path.insert(0, str(comfy_root))
+    try:
+        from comfy.quant_ops import TensorCoreNVFP4Layout
+    except ModuleNotFoundError as error:
+        raise SystemExit(f"nvfp4 conversion requires ComfyUI at {comfy_root}: {error}") from error
+    return TensorCoreNVFP4Layout
+
+
+def nvfp4_should_quantize_2d(k, v):
+    return (
+        k.startswith("model.decoder.layers.")
+        and k.endswith(NVFP4_ATTN_SUFFIXES + NVFP4_MLP_SUFFIXES)
+        and v.dim() == 2
+    )
+
+
+def quantize_nvfp4_2d(w, device):
+    layout = nvfp4_layout()
+    x = w.to(device=device, dtype=torch.bfloat16)
+    qdata, params = layout.quantize(x)
+    out = {
+        suffix: value.cpu()
+        for suffix, value in layout.state_dict_tensors(qdata, params).items()
+    }
+    del x, qdata, params
+    return out
+
+
+def add_nvfp4_2d(out, k, w, device):
+    base = k[:-len(".weight")]
+    for suffix, value in quantize_nvfp4_2d(w, device).items():
+        out[f"{base}.weight{suffix}"] = value
+    out[f"{base}.comfy_quant"] = sorted_marker_tensor(
+        {"format": "nvfp4", "full_precision_matrix_mult": False}
+    )
+
+
+def add_nvfp4_bank(out, base, bank, device):
+    q_chunks = []
+    scale_chunks = collections.defaultdict(list)
+    for expert in range(bank.shape[0]):
+        tensors = quantize_nvfp4_2d(bank[expert], device)
+        q_chunks.append(tensors.pop(""))
+        for suffix, value in tensors.items():
+            scale_chunks[suffix].append(value)
+    out[f"{base}.weight"] = torch.stack(q_chunks, dim=0)
+    for suffix, chunks in scale_chunks.items():
+        out[f"{base}.weight{suffix}"] = torch.stack(chunks, dim=0)
+    out[f"{base}.comfy_quant"] = sorted_marker_tensor(
+        {
+            "format": "nvfp4",
+            "full_precision_matrix_mult": False,
+            "num_experts": int(bank.shape[0]),
+        }
+    )
 
 
 def mxfp8_fused_conf():
@@ -542,27 +584,21 @@ def quantize_int4_bank(k, w, dev):
     ]
     marker = convrot_w4a4_checkpoint_quant_config(convrot_groupsize=gs)
     marker["num_experts"] = num_experts
+    marker["linear_dtype"] = "int8"
     return {
         f"{base}.weight": torch.stack([item[0].detach().to("cpu") for item in quantized]).contiguous(),
         f"{base}.weight_scale": torch.stack([item[1].detach().to("cpu") for item in quantized]).contiguous(),
-        f"{base}.comfy_quant": marker_tensor(marker),
+        f"{base}.comfy_quant": compact_marker_tensor(marker),
     }
 
 
-def cast(sd, precision, device="cpu"):
-    if precision == "mxfp8_qkv_patch":
-        out = dict(sd)
-        fused = fuse_mxfp8_attention_projections(out)
-        print(f"{precision}: fused {fused} attention projection groups without requantization")
-        return out
-    if precision == "int8_qkv_patch":
-        out = dict(sd)
-        fused = fuse_int8_attention_projections(out)
-        print(f"{precision}: fused {fused} attention projection groups without requantization")
-        return out
-
+def cast(sd, precision):
     out = {}
     nq = 0
+    cpu = "cpu"
+    nvfp4_device = torch.device("cuda:0") if precision == "nvfp4" else None
+    if precision == "nvfp4" and not torch.cuda.is_available():
+        raise SystemExit("canonical nvfp4 conversion requires CUDA device 0")
     for k, v in sd.items():
         if not torch.is_tensor(v):
             continue
@@ -577,7 +613,7 @@ def cast(sd, precision, device="cpu"):
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
-        elif precision in ("mxfp8_fused", "mxfp8_fused_qkv"):
+        elif precision == "mxfp8":
             if is_expert_bank(k):
                 out.update(quantize_mxfp8_fused_bank(k, v))
                 nq += 1
@@ -586,68 +622,82 @@ def cast(sd, precision, device="cpu"):
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
-        elif precision in ("int8", "int8_fused_qkv"):
+        elif precision == "int8":
             if is_expert_bank(k):
-                out.update(quantize_int8_bank(k, v, device))
+                out.update(quantize_int8_bank(k, v, cpu))
                 nq += 1
             elif int8_convrot_eligible_2d(k, v):
-                out.update(quantize_int8_2d(k, v, device))
+                out.update(quantize_int8_2d(k, v, cpu))
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         elif precision == "int4":
             if is_expert_bank(k):
-                out.update(quantize_int4_bank(k, v, device))
+                out.update(quantize_int4_bank(k, v, cpu))
                 nq += 1
             elif int8_convrot_eligible_2d(k, v):
-                out.update(quantize_int8_2d(k, v, device))
+                out.update(quantize_int8_2d(k, v, cpu))
+                nq += 1
+            else:
+                out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
+        elif precision == "nvfp4":
+            if k.endswith(".experts.gate_up_proj.weight"):
+                half = v.shape[1] // 2
+                if v.shape[1] % 2:
+                    raise SystemExit(f"{k}: odd fused gate_up dimension {v.shape[1]}")
+                prefix = k[:-len(".experts.gate_up_proj.weight")]
+                add_nvfp4_bank(out, f"{prefix}.experts.gate_proj", v[:, :half, :], nvfp4_device)
+                add_nvfp4_bank(out, f"{prefix}.experts.up_proj", v[:, half:, :], nvfp4_device)
+                nq += 2
+            elif k.endswith(".experts.down_proj.weight"):
+                add_nvfp4_bank(out, k[:-len(".weight")], v, nvfp4_device)
+                nq += 1
+            elif nvfp4_should_quantize_2d(k, v):
+                add_nvfp4_2d(out, k, v, nvfp4_device)
                 nq += 1
             else:
                 out[k] = v.to(torch.bfloat16) if (k != "tokenizer_json" and v.is_floating_point()) else v
         else:
             raise SystemExit(f"unknown precision: {precision}")
-    if precision == "mxfp8_fused_qkv":
+    if precision == "mxfp8":
         fused = fuse_mxfp8_attention_projections(out)
         print(f"{precision}: fused {fused} attention projection groups")
-    if precision == "int8_fused_qkv":
+    if precision == "int8":
         fused = fuse_int8_attention_projections(out)
         print(f"{precision}: fused {fused} attention projection groups")
-    if precision in ("fp8", "mxfp8_fused", "mxfp8_fused_qkv", "int8", "int8_fused_qkv", "int4"):
+    if precision != "bf16":
         print(f"{precision}: quantized {nq} weights")
     return out
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert DiffusionGemma to ComfyUI safetensors (V2, Kijai conversion).")
+    ap = argparse.ArgumentParser(description="Create canonical ComfyUI DiffusionGemma artifacts.")
     ap.add_argument("--src", required=True, help="HF snapshot dir or a ComfyUI bf16 safetensors")
-    ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
-                    help="repeatable; one source load serves every job")
-    ap.add_argument("--device", default="cpu",
-                    help="int8/int4 convrot device; cpu is the canonical byte-reproducible target "
-                         "(interceptor CPU). bf16/fp8/MXFP8 jobs ignore this; "
-                         "MXFP8 conversion always uses the deterministic CPU producer.")
+    ap.add_argument(
+        "--job",
+        action="append",
+        required=True,
+        metavar="QUANT:OUT",
+        help="repeatable canonical job: bf16, fp8, int8, int4, mxfp8, or nvfp4",
+    )
     args = ap.parse_args()
 
     base = load_base(args.src)
-    mismatched = []
     for job in args.job:
-        precision, sep, remainder = job.partition(":")
-        if not sep or not remainder:
-            raise SystemExit(f"invalid --job {job!r}; expected PRECISION:OUT[:SHA256]")
-        out, expected = remainder, None
-        head, sha_sep, tail = remainder.rpartition(":")
-        if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
-            out, expected = head, tail.lower()
-        tensors = cast(base, precision, device=args.device)
+        precision, sep, out = job.partition(":")
+        if not sep or not out or precision not in CANONICAL_SHA256:
+            choices = ", ".join(CANONICAL_SHA256)
+            raise SystemExit(f"invalid --job {job!r}; expected one of {choices} as QUANT:OUT")
+        if ":" in out:
+            raise SystemExit("the canonical SHA is fixed by the converter, not supplied by the caller")
+        tensors = cast(base, precision)
         save_file(tensors, out)
         digest = sha256(out)
-        verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
-        print(f"{precision:14s} {digest}  {out}{verdict}")
-        if expected is not None and digest != expected:
-            mismatched.append(out)
-
-    if mismatched:
-        raise SystemExit(f"SHA256 mismatch: {', '.join(mismatched)}")
+        expected = CANONICAL_SHA256[precision]
+        verdict = "OK" if digest == expected else "MISMATCH"
+        print(f"{precision:7s} {digest}  {out}  {verdict}")
+        if digest != expected:
+            raise SystemExit(f"{precision} SHA256 mismatch: expected {expected}, got {digest}")
 
 
 if __name__ == "__main__":
