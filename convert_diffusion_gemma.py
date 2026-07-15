@@ -28,21 +28,22 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-# int8 convrot is delegated to comfy-quants' stock-ComfyUI producer (byte-matches
-# ComfyUI's own save path), same as convert_gemma4.py.
+# INT8 and MXFP8 use comfy-quants' stock-ComfyUI producers. The canonical INT4
+# producer lives here because its only accepted use is this DiffusionGemma recipe.
 try:
-    from comfy_quants.backends.convrot_w4a4_model_export import _quantize_convrot_w4a4_per_row
     from comfy_quants.backends.int8_tensorwise_model_export import _quantize_int8_tensorwise_per_row
-    from comfy_quants.formats.convrot_w4a4 import convrot_w4a4_checkpoint_quant_config
+    from comfy_quants.formats.convrot import build_hadamard, rotate_weight
+    from comfy_quants.formats.int4_common import pack_signed_int4_pairs
     from comfy_quants.formats.int8_tensorwise import int8_tensorwise_checkpoint_quant_config
     from comfy_quants.formats.mxfp8_blocked import BLOCK_SIZE as MXFP8_BLOCK
     from comfy_quants.formats.mxfp8_blocked import quantize_mxfp8_block
 except ModuleNotFoundError as error:
     if error.name != "comfy_quants":
         raise
-    _quantize_convrot_w4a4_per_row = None
     _quantize_int8_tensorwise_per_row = None
-    convrot_w4a4_checkpoint_quant_config = None
+    build_hadamard = None
+    rotate_weight = None
+    pack_signed_int4_pairs = None
     int8_tensorwise_checkpoint_quant_config = None
     quantize_mxfp8_block = None
     MXFP8_BLOCK = 32
@@ -105,6 +106,38 @@ def marker_tensor(conf):
 def compact_marker_tensor(conf):
     data = json.dumps(conf, separators=(",", ":")).encode("utf-8")
     return torch.tensor(list(data), dtype=torch.uint8)
+
+
+def convrot_w4a4_checkpoint_quant_config(*, convrot_groupsize, linear_dtype="int4"):
+    conf = {
+        "format": "convrot_w4a4",
+        "convrot_groupsize": int(convrot_groupsize),
+    }
+    if linear_dtype != "int4":
+        conf["linear_dtype"] = linear_dtype
+    return conf
+
+
+def _quantize_convrot_w4a4_per_row(tensor, *, group_size):
+    if build_hadamard is None:
+        raise SystemExit("int4 conversion requires comfy-quants")
+    weight = tensor.detach()
+    if weight.dim() != 2:
+        raise SystemExit("ConvRot W4A8 export requires a rank-2 weight tensor")
+    if weight.shape[1] % group_size:
+        raise SystemExit(
+            f"in_features {weight.shape[1]} not divisible by convrot group size {group_size}"
+        )
+    if weight.shape[1] % 64:
+        raise SystemExit(
+            f"in_features {weight.shape[1]} not divisible by quant group size 64"
+        )
+    hadamard = build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    rotated = rotate_weight(weight, hadamard, group_size)
+    scale = rotated.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / 7.0
+    quantized = (rotated / scale).round_().clamp_(-7, 7).to(torch.int8)
+    packed = pack_signed_int4_pairs(quantized)
+    return packed, scale.reshape(weight.shape[0]).to(torch.float32).contiguous()
 
 
 def sorted_marker_tensor(conf):
