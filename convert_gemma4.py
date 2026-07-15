@@ -89,7 +89,9 @@ def read_safetensors_header(path):
 
 
 def write_tensor_bytes(handle, tensor):
-    payload = memoryview(tensor.detach().to("cpu").contiguous().view(torch.uint8).numpy()).cast("B")
+    payload = memoryview(
+        tensor.detach().to("cpu").contiguous().reshape(-1).view(torch.uint8).numpy()
+    ).cast("B")
     for start in range(0, len(payload), STREAM_CHUNK):
         handle.write(payload[start:start + STREAM_CHUNK])
 
