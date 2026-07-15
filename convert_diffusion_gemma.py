@@ -21,6 +21,7 @@ import glob
 import hashlib
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -97,6 +98,44 @@ def sha256(path):
         for chunk in iter(lambda: f.read(1 << 22), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def save_canonical_int4(tensors, output_path):
+    dtype_names = {
+        torch.bfloat16: "BF16",
+        torch.float32: "F32",
+        torch.int8: "I8",
+        torch.uint8: "U8",
+    }
+    header = {}
+    offset = 0
+    for key in sorted(tensors):
+        tensor = tensors[key]
+        try:
+            dtype = dtype_names[tensor.dtype]
+        except KeyError as error:
+            raise SystemExit(f"int4: unsupported output dtype for {key}: {tensor.dtype}") from error
+        size = tensor.numel() * tensor.element_size()
+        header[key] = {
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    output = Path(output_path)
+    temporary = output.with_suffix(output.suffix + ".partial")
+    with temporary.open("wb", buffering=0) as handle:
+        handle.write(struct.pack("<Q", len(encoded)))
+        handle.write(encoded)
+        for key in sorted(tensors):
+            tensor = tensors[key].detach().to("cpu").contiguous()
+            payload = memoryview(tensor.view(torch.uint8).numpy()).cast("B")
+            for start in range(0, len(payload), 16 * 1024 * 1024):
+                handle.write(payload[start:start + 16 * 1024 * 1024])
+    os.replace(temporary, output)
 
 
 def marker_tensor(conf):
@@ -724,7 +763,10 @@ def main():
         if ":" in out:
             raise SystemExit("the canonical SHA is fixed by the converter, not supplied by the caller")
         tensors = cast(base, precision)
-        save_file(tensors, out)
+        if precision == "int4":
+            save_canonical_int4(tensors, out)
+        else:
+            save_file(tensors, out)
         digest = sha256(out)
         expected = CANONICAL_SHA256[precision]
         verdict = "OK" if digest == expected else "MISMATCH"
