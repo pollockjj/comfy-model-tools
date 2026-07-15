@@ -4,8 +4,9 @@ Convert Gemma-4 (E2B / E4B) checkpoints to ComfyUI text-encoder safetensors.
 
 V3 = V2 + int8 convrot. The bf16 and fp8_scaled jobs ARE V2's exact code, byte-identical
 to V2 (afe21e7c / bf0b4fa2 — the shipped Comfy-Org / prior ComfyUI files). The only
-addition over V2 is the int8 job. One source load serves every --job; the source may be a
-Hugging Face snapshot directory or an existing ComfyUI bf16 safetensors.
+addition over V2 is the int8 job. Jobs are processed independently so conversion stays
+within 32 GiB host memory; the source may be a Hugging Face snapshot directory or an
+existing ComfyUI bf16 safetensors.
 
 Precisions:
   bf16                          HF language/vision/audio/projector layout remapped to
@@ -36,6 +37,7 @@ and fp8_scaled are matmul-free (byte-identical on any machine); int8 convrot is 
 CPU canonical.
 """
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -169,7 +171,8 @@ def quantize_int8_weight(k, v, dev):
 def cast(sd, precision, device="cpu"):
     out = {}
     nq = 0
-    for k, v in sd.items():
+    for k in list(sd):
+        v = sd.pop(k)
         if not torch.is_tensor(v):
             continue
         if precision == "bf16":
@@ -205,7 +208,6 @@ def main():
                          "(interceptor-CPU mandate), cuda is throwaway-speed only")
     args = ap.parse_args()
 
-    base = load_base(args.src)
     mismatched = []
     for job in args.job:
         precision, sep, remainder = job.partition(":")
@@ -215,13 +217,17 @@ def main():
         head, sha_sep, tail = remainder.rpartition(":")
         if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
             out, expected = head, tail.lower()
+        base = load_base(args.src)
         tensors = cast(base, precision, args.device)
+        del base
         save_file(tensors, out)
         digest = sha256(out)
         verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
         print(f"{precision:14s} {digest}  {out}{verdict}")
         if expected is not None and digest != expected:
             mismatched.append(out)
+        del tensors
+        gc.collect()
 
     if mismatched:
         raise SystemExit(f"SHA256 mismatch: {', '.join(mismatched)}")

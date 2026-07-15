@@ -23,8 +23,8 @@ python convert_diffusion_gemma.py --src /path/to/source \
 ## Convert Gemma 4 E2B / E4B
 
 `convert_gemma4.py` converts either Gemma 4 variant from a Hugging Face snapshot or
-an existing ComfyUI BF16 text encoder. One source load can write deterministic BF16,
-Kijai-compatible scaled FP8, and INT8 ConvRot jobs. The INT8 policy covers eligible
+an existing ComfyUI BF16 text encoder. Each job consumes and releases its source tensors
+so BF16, scaled FP8, and INT8 ConvRot conversion fit within 32 GiB host memory. The INT8 policy covers eligible
 language-model matrices while leaving vision, audio, and projector tensors in BF16.
 
 ```sh
