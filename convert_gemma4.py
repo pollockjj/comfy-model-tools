@@ -41,6 +41,8 @@ import gc
 import hashlib
 import json
 import os
+import struct
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -56,6 +58,8 @@ FP8_INFO = torch.finfo(FP8_DTYPE)
 FP8_MAX = 416.0  # Kijai Gemma-4 FP8 V1 convention
 FP8_CONF = {"format": "float8_e4m3fn", "full_precision_matrix_mult": False}
 INT8_CONVROT_GROUPSIZE = 256
+STREAM_CHUNK = 16 * 1024 * 1024
+SAFETENSORS_DTYPE_ORDER = {"F32": 0, "BF16": 1, "F8_E4M3": 2, "U8": 3}
 
 PREFIX_MAP = [
     ("model.language_model.", "model."),
@@ -76,6 +80,106 @@ def sha256(path):
         for chunk in iter(lambda: f.read(1 << 22), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def read_safetensors_header(path):
+    with open(path, "rb") as handle:
+        header_len = struct.unpack("<Q", handle.read(8))[0]
+        return 8 + header_len, json.loads(handle.read(header_len))
+
+
+def write_tensor_bytes(handle, tensor):
+    payload = memoryview(tensor.detach().to("cpu").contiguous().view(torch.uint8).numpy()).cast("B")
+    for start in range(0, len(payload), STREAM_CHUNK):
+        handle.write(payload[start:start + STREAM_CHUNK])
+
+
+def copy_file_range(source_fd, source_offset, size, output):
+    copied = 0
+    while copied < size:
+        payload = os.pread(source_fd, min(STREAM_CHUNK, size - copied), source_offset + copied)
+        if not payload:
+            raise RuntimeError(f"short read at source offset {source_offset + copied}")
+        output.write(payload)
+        copied += len(payload)
+
+
+def should_quantize_fp8_scaled_spec(key, entry):
+    shape = entry["shape"]
+    return (
+        key.startswith("model.")
+        and key.endswith(".weight")
+        and len(shape) == 2
+        and "norm" not in key
+        and max(shape) >= 4096
+    )
+
+
+def save_fp8_scaled_streaming(source_path, output_path):
+    source_start, source_header = read_safetensors_header(source_path)
+    source_header.pop("__metadata__", None)
+    marker = json.dumps(FP8_CONF).encode("utf-8")
+    outputs = {}
+    for key, entry in source_header.items():
+        if should_quantize_fp8_scaled_spec(key, entry):
+            base = key.removesuffix(".weight")
+            outputs[f"{base}.weight"] = ("F8_E4M3", entry["shape"], key, "quant")
+            outputs[f"{base}.weight_scale"] = ("F32", [], key, "scale")
+            outputs[f"{base}.comfy_quant"] = ("U8", [len(marker)], key, "marker")
+        else:
+            outputs[key] = (entry["dtype"], entry["shape"], key, "copy")
+
+    ordered = sorted(outputs, key=lambda key: (SAFETENSORS_DTYPE_ORDER[outputs[key][0]], key))
+    output_header = {}
+    offset = 0
+    dtype_sizes = {"F32": 4, "BF16": 2, "F8_E4M3": 1, "U8": 1}
+    for key in ordered:
+        dtype, shape, _, _ = outputs[key]
+        size = dtype_sizes[dtype]
+        for dimension in shape:
+            size *= dimension
+        output_header[key] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+
+    encoded = json.dumps(output_header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    output_path = Path(output_path)
+    temporary = output_path.with_suffix(output_path.suffix + ".partial")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    try:
+        with temporary.open("wb", buffering=0) as output, safe_open(
+            source_path, framework="pt", device="cpu"
+        ) as source:
+            output.write(struct.pack("<Q", len(encoded)))
+            output.write(encoded)
+            for key in ordered:
+                _, _, source_key, operation = outputs[key]
+                if operation == "copy":
+                    begin, end = source_header[source_key]["data_offsets"]
+                    copy_file_range(source_fd, source_start + begin, end - begin, output)
+                elif operation == "marker":
+                    output.write(marker)
+                else:
+                    tensor = source.get_tensor(source_key)
+                    weight = tensor.float()
+                    scale = torch.max(torch.abs(weight)) / FP8_MAX
+                    if operation == "scale":
+                        write_tensor_bytes(output, scale)
+                    else:
+                        quantized = (weight / scale).clamp(
+                            min=FP8_INFO.min, max=FP8_INFO.max
+                        ).to(FP8_DTYPE)
+                        write_tensor_bytes(output, quantized)
+                        del quantized
+                    del tensor, weight, scale
+                    gc.collect()
+        os.replace(temporary, output_path)
+    finally:
+        os.close(source_fd)
 
 
 def marker_tensor(conf):
@@ -217,10 +321,14 @@ def main():
         head, sha_sep, tail = remainder.rpartition(":")
         if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
             out, expected = head, tail.lower()
-        base = load_base(args.src)
-        tensors = cast(base, precision, args.device)
-        del base
-        save_file(tensors, out)
+        if precision == "fp8_scaled" and not os.path.isdir(args.src):
+            save_fp8_scaled_streaming(args.src, out)
+            tensors = None
+        else:
+            base = load_base(args.src)
+            tensors = cast(base, precision, args.device)
+            del base
+            save_file(tensors, out)
         digest = sha256(out)
         verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
         print(f"{precision:14s} {digest}  {out}{verdict}")
