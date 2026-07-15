@@ -1,42 +1,63 @@
 #!/usr/bin/env python3
 """
-Convert Qwen3.5 checkpoints to ComfyUI text-encoder safetensors.
+Reproduce the released Comfy-Org Qwen3.5 BF16 text-encoder artifacts.
 
-REV0 HISTORICAL PROVENANCE ONLY. DO NOT USE THIS AS A FAMILY RELEASE RECIPE.
+Rev0 is model-specific. It accepts only these pinned original checkpoints:
 
-This file records the first attempted reconstruction committed as 1c21d4d. It
-reproduces the released Qwen3.5-9B SHA256 exactly, but it always writes
-``{"format": "pt"}``. That makes its 2B output wrong and makes the 4B path wrong
-by the same release-metadata mismatch. Observed 2B output:
-878fd1eb88e97daaa6d235d5c25bdec0271d3a031f085eb51876e18d7ae50a59;
-canonical 2B:
-aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1.
-Observed 9B output and canonical SHA256:
-7e6e9f08d598f829cb940e60ac0c698e1f1c27a47daffd7e598cd78c78b4cc53.
-This behavior is retained unchanged for posterity and provenance. Rev1 will
-encode and verify each released family member explicitly.
+  Qwen/Qwen3.5-2B @ 15852e8c16360a2fea060d615a32b45270f8a8fc
+  Qwen/Qwen3.5-4B @ 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  Qwen/Qwen3.5-9B @ c202236235762e1c871ad0ccb60c8ee5ba337b9a
 
-The attempted conversion preserves the released 9B dtype policy:
+Each model has an explicit released construction:
+
+  2B  The official single safetensors file is already byte-identical to the
+      Comfy-Org artifact. Copy it without reserialization or metadata changes.
+  4B  Merge the two official shards unchanged with no safetensors metadata.
+  9B  Merge the four official shards unchanged with {"format": "pt"} metadata.
+
+The source shard hashes and complete output hashes are embedded. Any source or
+output drift fails loud. No recipe for one model is applied to another model.
 
 Example:
-  python convert_qwen35.py --src qwen3.5_9b_bf16.safetensors \
-      --job bf16:qwen3.5_9b_bf16.safetensors
-
-A job may carry an expected SHA256 (PRECISION:OUT:SHA256) to verify the written
-file. Source may be an existing released/ComfyUI bf16 safetensors or an HF
-snapshot directory containing model.safetensors or model-*-of-*.safetensors.
+  python convert_qwen35.py --src Qwen3.5-4B-snapshot \
+      --out qwen3.5_4b_bf16.safetensors
 """
 import argparse
 import glob
 import hashlib
 import os
+import shutil
 
-import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-F32_SUFFIXES = (".linear_attn.A_log", ".linear_attn.norm.weight")
+PINNED_SOURCE_SHAS = {
+    "qwen3.5_2b": (
+        "aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1",
+    ),
+    "qwen3.5_4b": (
+        "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61",
+        "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188",
+    ),
+    "qwen3.5_9b": (
+        "db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e",
+        "31c7d7e2dd5d207840b31cc59083c8f4c4718959149e0358c0364052bb9a0330",
+        "7ec36ba3a4176a44c3c0876ad80c56a2f70c84bf008d82e9501df642f17dadec",
+        "b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6",
+    ),
+}
+
+EXPECTED_SHAS = {
+    "qwen3.5_2b": "aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1",
+    "qwen3.5_4b": "9fb3ae42003750fe2d16350259a3ec07761d6d13a8e2b244a6e22fa9d8050841",
+    "qwen3.5_9b": "7e6e9f08d598f829cb940e60ac0c698e1f1c27a47daffd7e598cd78c78b4cc53",
+}
+
+RELEASE_METADATA = {
+    "qwen3.5_4b": None,
+    "qwen3.5_9b": {"format": "pt"},
+}
 
 
 def sha256(path):
@@ -50,73 +71,60 @@ def sha256(path):
 def iter_safetensors(src):
     if os.path.isfile(src):
         return [src]
-    single = os.path.join(src, "model.safetensors")
-    if os.path.isfile(single):
-        return [single]
-    shards = sorted(glob.glob(os.path.join(src, "model-*-of-*.safetensors")))
-    if not shards:
-        raise SystemExit(f"no safetensors source found in {src}")
-    return shards
+    patterns = (
+        "model.safetensors",
+        "model.safetensors-*-of-*.safetensors",
+        "model-*-of-*.safetensors",
+    )
+    for pattern in patterns:
+        files = sorted(glob.glob(os.path.join(src, pattern)))
+        if files:
+            return files
+    raise SystemExit(f"no original Qwen3.5 safetensors source found in {src}")
 
 
-def load_base(src):
-    files = iter_safetensors(src)
-    out = {}
+def identify_pinned_source(files):
+    digests = tuple(sha256(file) for file in files)
+    for variant, expected in PINNED_SOURCE_SHAS.items():
+        if digests == expected:
+            print(f"verified pinned source: {variant}")
+            return variant
+    raise SystemExit(f"unrecognized source shard SHA256 tuple: {digests}")
+
+
+def merge_shards(files):
+    tensors = {}
     for file in files:
         with safe_open(file, framework="pt", device="cpu") as st:
             for key in st.keys():
-                out[key] = st.get_tensor(key)
-    print(f"loaded Qwen3.5 source: {len(out)} tensors, {len(files)} file(s)")
-    return out
-
-
-def cast(sd, precision):
-    if precision != "bf16":
-        raise SystemExit(f"unknown precision: {precision}")
-    out = {}
-    kept_f32 = 0
-    for k, v in sd.items():
-        if not torch.is_tensor(v):
-            continue
-        if v.is_floating_point():
-            if k.endswith(F32_SUFFIXES):
-                out[k] = v.to(torch.float32)
-                kept_f32 += 1
-            else:
-                out[k] = v.to(torch.bfloat16)
-        else:
-            out[k] = v
-    print(f"bf16: kept_f32={kept_f32}")
-    return out
+                if key in tensors:
+                    raise SystemExit(f"duplicate tensor across source shards: {key}")
+                tensors[key] = st.get_tensor(key)
+    print(f"loaded {len(tensors)} tensors from {len(files)} pinned source shards")
+    return tensors
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Qwen3.5 Rev0 historical reconstruction; valid for the 9B artifact only.")
-    ap.add_argument("--src", required=True, help="HF snapshot dir or ComfyUI/released bf16 safetensors")
-    ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
-                    help="repeatable; one source load serves every job")
+    ap = argparse.ArgumentParser(description="Qwen3.5 Rev0 deterministic release converter.")
+    ap.add_argument("--src", required=True, help="pinned original HF snapshot directory")
+    ap.add_argument("--out", required=True, help="output ComfyUI safetensors file")
     args = ap.parse_args()
 
-    base = load_base(args.src)
-    mismatched = []
-    for job in args.job:
-        precision, sep, remainder = job.partition(":")
-        if not sep or not remainder:
-            raise SystemExit(f"invalid --job {job!r}; expected PRECISION:OUT[:SHA256]")
-        out, expected = remainder, None
-        head, sha_sep, tail = remainder.rpartition(":")
-        if sha_sep and len(tail) == 64 and all(c in "0123456789abcdefABCDEF" for c in tail):
-            out, expected = head, tail.lower()
-        tensors = cast(base, precision)
-        save_file(tensors, out, metadata={"format": "pt"})
-        digest = sha256(out)
-        verdict = "" if expected is None else ("  OK" if digest == expected else "  MISMATCH")
-        print(f"{precision:14s} {digest}  {out}{verdict}")
-        if expected is not None and digest != expected:
-            mismatched.append(out)
+    files = iter_safetensors(args.src)
+    variant = identify_pinned_source(files)
+    if variant == "qwen3.5_2b":
+        if os.path.abspath(files[0]) != os.path.abspath(args.out):
+            shutil.copyfile(files[0], args.out)
+    else:
+        tensors = merge_shards(files)
+        save_file(tensors, args.out, metadata=RELEASE_METADATA[variant])
 
-    if mismatched:
-        raise SystemExit(f"SHA256 mismatch: {', '.join(mismatched)}")
+    digest = sha256(args.out)
+    expected = EXPECTED_SHAS[variant]
+    verdict = "OK" if digest == expected else "MISMATCH"
+    print(f"{variant:12s} {digest}  {args.out}  {verdict}")
+    if digest != expected:
+        raise SystemExit(f"SHA256 mismatch for {variant}: expected {expected}, got {digest}")
 
 
 if __name__ == "__main__":
