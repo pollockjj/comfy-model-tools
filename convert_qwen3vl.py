@@ -2,8 +2,18 @@
 """
 Convert Qwen3-VL 4B / 8B checkpoints to ComfyUI text-encoder safetensors.
 
-Rev1 is the release-SHA reproduction script for the shipped Comfy-Org Qwen3-VL
-text encoders. It deliberately preserves the released conversion conventions:
+REV0 HISTORICAL PROVENANCE ONLY. DO NOT USE THIS AS A RELEASE RECIPE.
+
+This file records the first attempted reconstruction committed as 1c21d4d. Its
+FP8 scale arithmetic is wrong: ``amax / 416.0`` does not reproduce the released
+artifacts. The observed 4B FP8 output is
+de5204f63b883abfdf32c54a28f173b43cc3f580f7ecb31d04a6793ba84b168a,
+not the canonical
+54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094.
+This behavior is retained unchanged for posterity and provenance. Rev1 will
+replace it with verified release arithmetic.
+
+The attempted conversion conventions were:
 
 Precisions:
   bf16                          release BF16 repack. 4B carries no safetensors
@@ -224,7 +234,7 @@ def cast(sd, precision, comfyui_root):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert Qwen3-VL to ComfyUI safetensors (Rev1 release-SHA reproduction).")
+    ap = argparse.ArgumentParser(description="Qwen3-VL Rev0 historical reconstruction; rejected for release use.")
     ap.add_argument("--src", required=True, help="HF snapshot dir or ComfyUI/released bf16 safetensors")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")

@@ -2,9 +2,21 @@
 """
 Convert Qwen3.5 checkpoints to ComfyUI text-encoder safetensors.
 
-Rev1 is the release-SHA reproduction script for the shipped Qwen3.5-9B bf16
-text encoder. It preserves the released dtype policy: linear-attention A_log
-and norm.weight tensors stay float32; every other floating tensor is bfloat16.
+REV0 HISTORICAL PROVENANCE ONLY. DO NOT USE THIS AS A FAMILY RELEASE RECIPE.
+
+This file records the first attempted reconstruction committed as 1c21d4d. It
+reproduces the released Qwen3.5-9B SHA256 exactly, but it always writes
+``{"format": "pt"}``. That makes its 2B output wrong and makes the 4B path wrong
+by the same release-metadata mismatch. Observed 2B output:
+878fd1eb88e97daaa6d235d5c25bdec0271d3a031f085eb51876e18d7ae50a59;
+canonical 2B:
+aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1.
+Observed 9B output and canonical SHA256:
+7e6e9f08d598f829cb940e60ac0c698e1f1c27a47daffd7e598cd78c78b4cc53.
+This behavior is retained unchanged for posterity and provenance. Rev1 will
+encode and verify each released family member explicitly.
+
+The attempted conversion preserves the released 9B dtype policy:
 
 Example:
   python convert_qwen35.py --src qwen3.5_9b_bf16.safetensors \
@@ -79,7 +91,7 @@ def cast(sd, precision):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert Qwen3.5 to ComfyUI safetensors (Rev1 release-SHA reproduction).")
+    ap = argparse.ArgumentParser(description="Qwen3.5 Rev0 historical reconstruction; valid for the 9B artifact only.")
     ap.add_argument("--src", required=True, help="HF snapshot dir or ComfyUI/released bf16 safetensors")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
