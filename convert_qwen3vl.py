@@ -24,8 +24,8 @@ Precisions:
   nvfp4                         8B only: lm_head and embed_tokens -> the same
                                 fp8_scaled path; the 36 x 7 projection weights
                                 -> released NVFP4 packing from BF16 arithmetic,
-                                including midpoint ties toward zero. Everything
-                                else bf16.
+                                including CUDA reciprocal-multiply ordering.
+                                Everything else bf16.
 
 Examples:
   python convert_qwen3vl.py --src Qwen3-VL-4B-Instruct-snapshot \
@@ -199,25 +199,26 @@ def import_nvfp4_block_layout(comfyui_root):
     if comfyui_root and comfyui_root not in sys.path:
         sys.path.insert(0, comfyui_root)
     try:
-        from comfy_kitchen.float_utils import to_blocked
+        from comfy_kitchen.float_utils import _f32_to_floatx_unpacked, pack_uint4, to_blocked
     except Exception as exc:
         raise SystemExit(
             "nvfp4 Rev0 reproduction requires comfy-kitchen's block layout. "
             "Run from the ComfyUI venv or pass --comfyui-root."
         ) from exc
-    return to_blocked
+    return to_blocked, _f32_to_floatx_unpacked, pack_uint4
 
 
-def quantize_nvfp4_weight(k, v, to_blocked):
+def quantize_nvfp4_weight(k, v, nvfp4_helpers):
     mapped = remap_language_key(k)
     base = mapped[:-len(".weight")]
+    to_blocked, f32_to_floatx, pack_uint4 = nvfp4_helpers
     rows, cols = v.shape
     if rows % 16 or cols % 16:
         raise SystemExit(f"released NVFP4 tensor is not 16x16 aligned: {mapped} {tuple(v.shape)}")
 
-    # The released CUDA conversion rounds exact E2M1 midpoints toward zero.
-    # comfy-kitchen's eager CPU fallback rounds those ties to even, producing
-    # different packed bytes. Reproduce the released rule explicitly on CPU.
+    # comfy-kitchen v0.2.9's released CUDA kernel multiplies by the reciprocal
+    # encode scale. Its eager CPU fallback divides by the decode scale. Those
+    # operations diverge at FP4 boundaries, so preserve the CUDA operation order.
     scale = (torch.amax(v.abs()) / (448.0 * 6.0)).to(torch.float32)
     blocked = v.reshape(rows, -1, 16)
     block_scale = torch.amax(blocked.abs(), dim=-1).to(torch.float32) / 6.0
@@ -226,18 +227,13 @@ def quantize_nvfp4_weight(k, v, to_blocked):
     total_scale = scale * block_scale_fp8.to(torch.float32)
     zero_scale = total_scale == 0
     safe_scale = torch.where(zero_scale, torch.ones_like(total_scale), total_scale)
-    normalized = blocked.to(torch.float32) / safe_scale.unsqueeze(-1)
+    encode_scale = torch.reciprocal(safe_scale)
+    normalized = blocked.to(torch.float32) * encode_scale.unsqueeze(-1)
     normalized = torch.where(zero_scale.unsqueeze(-1), torch.zeros_like(normalized), normalized)
     normalized = normalized.clamp(-6.0, 6.0).view(rows, cols)
 
-    midpoints = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-        dtype=torch.float32,
-        device=normalized.device,
-    )
-    unpacked = torch.bucketize(normalized.abs(), midpoints, right=False).to(torch.uint8)
-    unpacked |= torch.signbit(normalized).to(torch.uint8) << 3
-    qweight = ((unpacked[:, ::2] << 4) | unpacked[:, 1::2]).contiguous()
+    unpacked = f32_to_floatx(normalized, 2, 1)
+    qweight = pack_uint4(unpacked, hi_first=True).contiguous()
     stored_block_scale = to_blocked(block_scale_fp8, flatten=False)
     return {
         f"{base}.weight": qweight.cpu(),
@@ -251,7 +247,7 @@ def cast(sd, precision, comfyui_root):
     out = {}
     nq = 0
     variant = model_variant(sd)
-    to_blocked = import_nvfp4_block_layout(comfyui_root) if precision == "nvfp4" else None
+    nvfp4_helpers = import_nvfp4_block_layout(comfyui_root) if precision == "nvfp4" else None
     if precision == "nvfp4" and variant != "qwen3vl_8b":
         raise SystemExit("released nvfp4 artifact exists for Qwen3VL-8B only")
 
@@ -271,7 +267,7 @@ def cast(sd, precision, comfyui_root):
             if mapped in ("lm_head.weight", "model.embed_tokens.weight"):
                 out.update(quantize_fp8_scaled_weight(k, v, out_key=mapped)); nq += 1
             elif is_lm_projection_weight(k):
-                out.update(quantize_nvfp4_weight(k, v, to_blocked)); nq += 1
+                out.update(quantize_nvfp4_weight(k, v, nvfp4_helpers)); nq += 1
             else:
                 out[mapped] = v.to(torch.bfloat16) if v.is_floating_point() else v
         else:
