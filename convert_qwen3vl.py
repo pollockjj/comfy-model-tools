@@ -25,8 +25,6 @@ Precisions:
                                 fp8_scaled path; the 36 x 7 projection weights
                                 -> released NVFP4 packing from BF16 arithmetic,
                                 including CUDA reciprocal-multiply ordering.
-                                One input-validated lm_head element preserves
-                                an isolated anomaly in the published artifact.
                                 Everything else bf16.
 
 Examples:
@@ -203,18 +201,6 @@ def quantize_fp8_scaled_weight(k, v, out_key=None):
     }
 
 
-def preserve_nvfp4_lm_head_release_anomaly(source, tensors):
-    row, col = 90450, 547
-    source_value = source[row, col]
-    qweight = tensors["lm_head.weight"]
-    expected_source = torch.tensor(0.000823974609375, dtype=torch.bfloat16)
-    expected_computed = torch.tensor(0.9375, dtype=FP8_DTYPE)
-    if source_value.cpu() != expected_source or qweight[row, col].cpu() != expected_computed:
-        raise SystemExit("published NVFP4 lm_head anomaly precondition changed")
-    qweight[row, col] = torch.tensor(0.875, dtype=FP8_DTYPE)
-    return tensors
-
-
 def emulate_released_nvfp4_fast_reciprocal(scale):
     reciprocal = torch.reciprocal(scale)
     up = torch.nextafter(reciprocal, torch.full_like(reciprocal, float("inf")))
@@ -298,8 +284,6 @@ def cast(sd, precision, comfyui_root):
         elif precision == "nvfp4":
             if mapped in ("lm_head.weight", "model.embed_tokens.weight"):
                 tensors = quantize_fp8_scaled_weight(k, v, out_key=mapped)
-                if mapped == "lm_head.weight":
-                    tensors = preserve_nvfp4_lm_head_release_anomaly(v, tensors)
                 out.update(tensors); nq += 1
             elif is_lm_projection_weight(k):
                 out.update(quantize_nvfp4_weight(k, v, nvfp4_helpers)); nq += 1
