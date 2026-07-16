@@ -26,6 +26,22 @@ identical to the artifact currently published by Comfy-Org on Hugging Face.
 No passing result for one family member authorizes behavior for another family
 member. Unsupported artifacts fail loud.
 
+### Pinned original sources
+
+| Original repository | Revision | Ordered source-shard SHA256 values |
+| --- | --- | --- |
+| `Qwen/Qwen3-VL-4B-Instruct` | `ebb281ec70b05090aa6165b016eac8ec08e71b17` | `30a01a0556622645a3cce87b655bbbbbc1f170c196099f1b666c93202c3339a9`, `046296a2a387efb43b0c997d5833c789604d168834f6e0d3064bf7bb13d002a6` |
+| `Qwen/Qwen3-VL-8B-Instruct` | `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b` | `d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa`, `8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5`, `83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192`, `0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5` |
+| `Qwen/Qwen3.5-2B` | `15852e8c16360a2fea060d615a32b45270f8a8fc` | `aa33250c4fc64891ddfaba3a314fd9542ea371843c387178b425fbcc5ed680b1` |
+| `Qwen/Qwen3.5-4B` | `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` | `26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61`, `cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188` |
+| `Qwen/Qwen3.5-9B` | `c202236235762e1c871ad0ccb60c8ee5ba337b9a` | `db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e`, `31c7d7e2dd5d207840b31cc59083c8f4c4718959149e0358c0364052bb9a0330`, `7ec36ba3a4176a44c3c0876ad80c56a2f70c84bf008d82e9501df642f17dadec`, `b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6` |
+
+Qwen3-VL 8B NVFP4 reproduces the CUDA operation order in comfy-kitchen
+`v0.2.9` (`5b45bd0`): encode values by multiplying with the reciprocal scale.
+That release was compiled with `--use_fast_math`; Rev0 emulates the observed
+one-ULP `rcp.approx.f32` results on CPU and then applies round-to-nearest-even
+E2M1 packing. The complete output SHA gate is mandatory.
+
 ## Rev0 verification record
 
 The complete matrix was regenerated from the pinned original sources on
