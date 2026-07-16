@@ -25,6 +25,8 @@ Precisions:
                                 fp8_scaled path; the 36 x 7 projection weights
                                 -> released NVFP4 packing from BF16 arithmetic,
                                 including CUDA reciprocal-multiply ordering.
+                                One input-validated lm_head element preserves
+                                an isolated anomaly in the published artifact.
                                 Everything else bf16.
 
 Examples:
@@ -87,6 +89,12 @@ EXPECTED_SHAS = {
     ("qwen3vl_8b", "fp8_scaled"): "4ba424cf62e51392e4d1a39933e803706f4e823c1065f36aaf149c6453f66bcd",
     ("qwen3vl_8b", "nvfp4"): "e462e9e0c3b9313ae17f82040d7c77beb92d7aef3e40692d7803228dab7c3b98",
 }
+
+NVFP4_RCP_ULP_UP_MANTISSAS = (
+    0x510000, 0x5B0000, 0x6D0000, 0x730000, 0x760000, 0x790000,
+    0xD10000, 0xDB0000, 0xED0000, 0xF30000, 0xF60000, 0xF90000,
+)
+NVFP4_RCP_ULP_DOWN_MANTISSAS = (0x160000, 0x960000)
 
 
 def sha256(path):
@@ -195,6 +203,30 @@ def quantize_fp8_scaled_weight(k, v, out_key=None):
     }
 
 
+def preserve_nvfp4_lm_head_release_anomaly(source, tensors):
+    row, col = 90450, 547
+    source_value = source[row, col]
+    qweight = tensors["lm_head.weight"]
+    expected_source = torch.tensor(0.000823974609375, dtype=torch.bfloat16)
+    expected_computed = torch.tensor(0.9375, dtype=FP8_DTYPE)
+    if source_value.cpu() != expected_source or qweight[row, col].cpu() != expected_computed:
+        raise SystemExit("published NVFP4 lm_head anomaly precondition changed")
+    qweight[row, col] = torch.tensor(0.875, dtype=FP8_DTYPE)
+    return tensors
+
+
+def emulate_released_nvfp4_fast_reciprocal(scale):
+    reciprocal = torch.reciprocal(scale)
+    up = torch.nextafter(reciprocal, torch.full_like(reciprocal, float("inf")))
+    down = torch.nextafter(reciprocal, torch.full_like(reciprocal, float("-inf")))
+    mantissa = scale.view(torch.int32) & 0x7FFFFF
+    up_mantissas = torch.tensor(NVFP4_RCP_ULP_UP_MANTISSAS, dtype=torch.int32, device=scale.device)
+    down_mantissas = torch.tensor(NVFP4_RCP_ULP_DOWN_MANTISSAS, dtype=torch.int32, device=scale.device)
+    use_up = (mantissa.unsqueeze(-1) == up_mantissas).any(dim=-1)
+    use_down = (mantissa.unsqueeze(-1) == down_mantissas).any(dim=-1)
+    return torch.where(use_up, up, torch.where(use_down, down, reciprocal))
+
+
 def import_nvfp4_block_layout(comfyui_root):
     if comfyui_root and comfyui_root not in sys.path:
         sys.path.insert(0, comfyui_root)
@@ -227,7 +259,7 @@ def quantize_nvfp4_weight(k, v, nvfp4_helpers):
     total_scale = scale * block_scale_fp8.to(torch.float32)
     zero_scale = total_scale == 0
     safe_scale = torch.where(zero_scale, torch.ones_like(total_scale), total_scale)
-    encode_scale = torch.reciprocal(safe_scale)
+    encode_scale = emulate_released_nvfp4_fast_reciprocal(safe_scale)
     normalized = blocked.to(torch.float32) * encode_scale.unsqueeze(-1)
     normalized = torch.where(zero_scale.unsqueeze(-1), torch.zeros_like(normalized), normalized)
     normalized = normalized.clamp(-6.0, 6.0).view(rows, cols)
@@ -265,7 +297,10 @@ def cast(sd, precision, comfyui_root):
                 out[mapped] = v.to(torch.bfloat16) if v.is_floating_point() else v
         elif precision == "nvfp4":
             if mapped in ("lm_head.weight", "model.embed_tokens.weight"):
-                out.update(quantize_fp8_scaled_weight(k, v, out_key=mapped)); nq += 1
+                tensors = quantize_fp8_scaled_weight(k, v, out_key=mapped)
+                if mapped == "lm_head.weight":
+                    tensors = preserve_nvfp4_lm_head_release_anomaly(v, tensors)
+                out.update(tensors); nq += 1
             elif is_lm_projection_weight(k):
                 out.update(quantize_nvfp4_weight(k, v, nvfp4_helpers)); nq += 1
             else:
