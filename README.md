@@ -22,6 +22,36 @@ python seedvr2_convert.py --src seedvr2_ema_3b.pth --cond pos_emb.pt,neg_emb.pt 
 
 The `mxfp8`, `nvfp4`, and `int8` modes require the `comfy-kitchen` package; the script exits with a message naming it if it is not installed.
 
+## Reproduce Qwen release artifacts
+
+`convert_qwen3vl.py` and `convert_qwen35.py` are Rev0 deterministic release
+recipes. They accept only embedded, SHA-pinned original Qwen checkpoints and
+always verify the complete output file against the corresponding artifact
+published by Comfy-Org on Hugging Face. Unsupported models or source revisions
+fail instead of inheriting a recipe from another family member.
+
+Qwen3-VL supports the released 4B BF16/FP8-scaled artifacts and the released 8B
+BF16/FP8-scaled/NVFP4 artifacts:
+
+```sh
+python convert_qwen3vl.py --src Qwen3-VL-4B-Instruct-snapshot \
+    --job bf16:qwen3vl_4b_bf16.safetensors \
+    --job fp8_scaled:qwen3vl_4b_fp8_scaled.safetensors
+```
+
+Qwen3.5 selects exactly one model-specific recipe from the pinned source shard
+hashes: 2B is copied byte-for-byte, 4B is merged without metadata, and 9B is
+merged with `{"format": "pt"}` metadata.
+
+```sh
+python convert_qwen35.py --src Qwen3.5-4B-snapshot \
+    --out qwen3.5_4b_bf16.safetensors
+```
+
+See [QWEN_CONVERTER_PROVENANCE.md](QWEN_CONVERTER_PROVENANCE.md) for the pinned
+source revisions, failed pre-Rev0 reconstruction findings, and all eight
+canonical output hashes proved by full regeneration.
+
 ## Quantize to `int8-convrot`
 
 Dry-run first (good idea to do this on a new architecture) — prints the plan, writes nothing

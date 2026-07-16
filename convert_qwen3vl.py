@@ -32,9 +32,10 @@ Examples:
       --job bf16:qwen3vl_4b_bf16.safetensors \
       --job fp8_scaled:qwen3vl_4b_fp8_scaled.safetensors
 
-  PYTHONPATH=/home/johnj/dev_master/ComfyUI python convert_qwen3vl.py \
+  PYTHONPATH=/path/to/ComfyUI python convert_qwen3vl.py \
       --src Qwen3-VL-8B-Instruct-snapshot \
-      --job nvfp4:qwen3vl_8b_nvfp4.safetensors
+      --job nvfp4:qwen3vl_8b_nvfp4.safetensors \
+      --comfyui-root /path/to/ComfyUI
 
 The optional SHA256 in PRECISION:OUT:SHA256 is accepted only when it equals the
 embedded canonical SHA. Source must be the pinned original HF snapshot.
@@ -301,8 +302,8 @@ def main():
     ap.add_argument("--src", required=True, help="pinned original HF snapshot directory")
     ap.add_argument("--job", action="append", required=True, metavar="PRECISION:OUT[:SHA256]",
                     help="repeatable; one source load serves every job")
-    ap.add_argument("--comfyui-root", default="/home/johnj/dev_master/ComfyUI",
-                    help="ComfyUI checkout used for Rev1 nvfp4 reproduction")
+    ap.add_argument("--comfyui-root",
+                    help="optional ComfyUI checkout that makes comfy-kitchen importable for nvfp4")
     args = ap.parse_args()
 
     files = iter_safetensors(args.src)
